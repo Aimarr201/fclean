@@ -1,0 +1,758 @@
+#!/usr/bin/env bash
+# fclean para las sesiones de usuario de Ubuntu del campus 42.
+set -euo pipefail
+umask 077
+shopt -s nullglob
+
+usage() {
+    cat <<'HELP'
+Uso: bash fclean [opción]
+  --dry-run     Muestra las cachés y el almacenamiento web que se vaciarían,
+                su tamaño y la migración opcional. Es la opción por defecto.
+  --clean       Vacía esas rutas en el home y en los destinos migrados.
+  --migrate     Mueve las extensiones de VS Code a ~/sgoinfre/USUARIO.
+  --migrate-cache  Conserva el contenido de ~/.cache y enlaza la carpeta a
+                $HOME/sgoinfre/$USER/.cache. Cierra las apps que la utilizan.
+                Si ya hay una caché en ambos sitios, usa rsync para combinarlas.
+  --install     Instala --clean al iniciar la sesión gráfica y configura en
+                ~/.zshrc las rutas de XDG, uv y Hugging Face para sgoinfre.
+  --uninstall   Desactiva el inicio automático y retira los exports de fclean.
+  --help        Muestra esta ayuda.
+
+Cierra VS Code en todos los equipos que compartan tu home antes de migrar.
+Si el campus vacía sgoinfre, tendrás que reinstalar las extensiones.
+La limpieza incluye los datos web locales de File System y CacheStorage y conserva la papelera.
+Las descargas almacenadas en caché pueden volver a necesitar conexión.
+HELP
+}
+
+die() { printf 'Error: %s\n' "$*" >&2; exit 1; }
+notice() { printf '%s\n' "$*" >&2; }
+present() { [[ -e $1 || -L $1 ]]; }
+
+(( $# <= 1 )) || { usage >&2; exit 2; }
+mode=${1:---dry-run}
+case $mode in
+    --help|-h) usage; exit 0 ;;
+    --dry-run|--clean|--migrate|--migrate-cache|--install|--uninstall|--prepare-env) ;;
+    *) usage >&2; exit 2 ;;
+esac
+
+[[ $(uname -s) == Linux && $EUID != 0 ]] || die 'Ejecuta fclean como usuario del campus en Ubuntu.'
+[[ ${HOME:-} == /* && -d $HOME ]] || die 'HOME debe ser un directorio absoluto.'
+home=$(realpath -e -- "$HOME")
+[[ $home != / ]] || die 'HOME apunta a la raíz.'
+account=$(id -un)
+[[ ${USER:-} == "$account" && -n $account && $account != */* && $account != . && $account != .. ]] ||
+    die 'USER debe coincidir con el nombre de la cuenta de la sesión.'
+sgo="$HOME/sgoinfre/$USER"
+config=${XDG_CONFIG_HOME:-$HOME/.config}
+[[ $config == /* ]] || die 'XDG_CONFIG_HOME debe ser absoluto.'
+installed="$config/fclean/fclean"
+desktop="$config/autostart/42-fclean.desktop"
+marker='# Gestionado por 42-fclean'
+zshrc="$HOME/.zshrc"
+begin='# >>> 42-SGOINFRE-SHIELD >>>'
+end='# <<< 42-SGOINFRE-SHIELD <<<'
+env_begin='# >>> fclean: entorno sgoinfre >>>'
+env_end='# <<< fclean: entorno sgoinfre <<<'
+
+# El bloqueo local también funciona cuando la cuota del home está agotada.
+if [[ $mode != --dry-run && $mode != --prepare-env ]]; then
+    runtime=${XDG_RUNTIME_DIR:-/run/user/$UID}
+    [[ -d $runtime && -O $runtime && ! -L $runtime ]] || die 'No se encuentra el directorio de ejecución de la sesión.'
+    exec 9>>"$runtime/42-fclean.lock"
+    flock -n 9 || die 'Ya hay otra ejecución de fclean o no se pudo tomar el bloqueo.'
+fi
+
+has_legacy_block() {
+    [[ -f $1 ]] || return 1
+    grep -Fxq -e "$begin" -e "$end" -- "$1" || { [[ $? == 1 ]] && return 1; die "No se pudo leer $1"; }
+}
+
+write_zsh_block() {
+    printf '%s\n' "$env_begin"
+    printf 'if /bin/bash %q --prepare-env; then\n' "$installed"
+    cat <<'ZSH'
+    SGO="$HOME/sgoinfre/$USER"
+    export XDG_CACHE_HOME="$SGO/.cache"
+    export XDG_DATA_HOME="$SGO/.local/share"
+    export UV_CACHE_DIR="$SGO/.cache/uv"
+    export HF_HOME="$SGO/.cache/huggingface"
+else
+    # Una subshell puede heredar estas rutas aunque se haya desmontado sgoinfre.
+    if [[ ${XDG_CACHE_HOME:-} == "$HOME/sgoinfre/${USER:-}/.cache" ]]; then unset XDG_CACHE_HOME; fi
+    if [[ ${XDG_DATA_HOME:-} == "$HOME/sgoinfre/${USER:-}/.local/share" ]]; then unset XDG_DATA_HOME; fi
+    if [[ ${UV_CACHE_DIR:-} == "$HOME/sgoinfre/${USER:-}/.cache/uv" ]]; then unset UV_CACHE_DIR; fi
+    if [[ ${HF_HOME:-} == "$HOME/sgoinfre/${USER:-}/.cache/huggingface" ]]; then unset HF_HOME; fi
+    if [[ ${SGO:-} == "$HOME/sgoinfre/${USER:-}" ]]; then unset SGO; fi
+fi
+ZSH
+    printf '%s\n' "$env_end"
+}
+
+update_zshrc() (
+    local action=$1 file=$zshrc input=/dev/null tmp backup block=''
+    if present "$file"; then
+        [[ -f $file ]] || die "Ruta de configuración inesperada: $file"
+        file=$(realpath -e -- "$file")
+        input=$file
+        if [[ $action == uninstall ]] && ! grep -Fxq -e "$env_begin" -e "$env_end" -- "$file"; then return 0; fi
+    elif [[ $action == uninstall ]]; then return 0
+    fi
+    tmp=$(mktemp -- "${file}.fclean.XXXXXXXX")
+    trap 'rm -f -- "$tmp"' EXIT
+    if [[ $action == install ]]; then block=$(write_zsh_block); fi
+    FCLEAN_ZSH_BLOCK="$block" awk -v action="$action" -v old="$begin" -v oldEnd="$end" -v new="$env_begin" -v newEnd="$env_end" '
+            $0 == new || (action == "install" && $0 == old) {
+                if (inside || seen[$0]++) exit 2
+                inside = ($0 == new ? newEnd : oldEnd)
+                if (action == "install" && !written++) print ENVIRON["FCLEAN_ZSH_BLOCK"]
+                next
+            }
+            $0 == newEnd || (action == "install" && $0 == oldEnd) {
+                if (inside != $0) exit 2
+                inside = ""
+                next
+            }
+            !inside { print }
+            END {
+                if (inside) exit 2
+                if (action == "install" && !written) print ENVIRON["FCLEAN_ZSH_BLOCK"]
+            }
+        ' "$input" > "$tmp" || die "Marcadores incompletos o repetidos en $file"
+    if [[ -f $file ]]; then
+        if cmp -s -- "$file" "$tmp"; then return 0; fi
+        chmod --reference="$file" -- "$tmp"
+        backup=$(mktemp -- "${file}.antes-de-fclean.XXXXXXXX")
+        cp -p -- "$file" "$backup"
+        printf 'Copia de la configuración: %s\n' "$backup"
+    fi
+    mv -T -- "$tmp" "$file"
+    printf 'Configuración de Zsh actualizada en %s\n' "$file"
+)
+
+install_autostart() (
+    local dir=${installed%/*} tmp entry path
+    if present "$desktop"; then
+        [[ -f $desktop && ! -L $desktop ]] && grep -Fxq -- "$marker" "$desktop" ||
+            die "Ya existe una entrada ajena en $desktop"
+    fi
+    [[ $dir != *$'\n'* && $dir != *$'\r'* ]] || die 'Ruta de configuración incompatible con el inicio automático.'
+    mkdir -p -- "$dir" "${desktop%/*}"
+    if present "$installed"; then
+        [[ -f $installed && ! -L $installed ]] && grep -Fxq -- '# fclean para las sesiones de usuario de Ubuntu del campus 42.' "$installed" ||
+            die "Ya existe otro archivo en $installed"
+    fi
+    tmp=$(mktemp -- "$dir/.instalacion.XXXXXXXX")
+    trap 'rm -f -- "$tmp"' EXIT
+    entry=$(mktemp -- "${desktop%/*}/.42-fclean.XXXXXXXX")
+    trap 'rm -f -- "$tmp" "$entry"' EXIT
+    cp -- "${BASH_SOURCE[0]}" "$tmp"
+    # Path fija el directorio de trabajo; Exec no necesita expandir HOME.
+    path=${dir//\\/\\\\}
+    printf '[Desktop Entry]\n%s\nType=Application\nName=fclean 42\nPath=%s\nExec=/bin/bash ./fclean --clean\nTerminal=false\n' "$marker" "$path" > "$entry"
+    mv -T -- "$tmp" "$installed"
+    update_zshrc install
+    mv -T -- "$entry" "$desktop"
+    printf 'Inicio automático instalado en %s\n' "$desktop"
+)
+
+case $mode in
+    --install) install_autostart; exit 0 ;;
+    --uninstall)
+        if present "$desktop"; then
+            [[ -f $desktop && ! -L $desktop ]] && grep -Fxq -- "$marker" "$desktop" ||
+                die "La entrada $desktop no pertenece a fclean."
+        fi
+        update_zshrc uninstall
+        if present "$desktop"; then rm -- "$desktop"; fi
+        printf 'Inicio automático desactivado.\n'
+        exit 0 ;;
+esac
+
+# Protege también montajes bind, que pueden tener el mismo número de dispositivo.
+mounts=()
+while read -r _ _ _ _ target _; do
+    printf -v target '%b' "$target"
+    mounts+=("$target")
+done < /proc/self/mountinfo
+
+plain_directory() {
+    local root=$1 dir=$2 mount
+    [[ $dir == "$root/"* && -d $dir && $(realpath -e -- "$dir") == "$dir" ]] || return 1
+    for mount in "${mounts[@]}"; do
+        [[ $mount == "$root/"* ]] || continue
+        [[ $dir != "$mount" && $dir != "$mount/"* && $mount != "$dir/"* ]] || return 1
+    done
+    return 0
+}
+
+app_closed() {
+    local status
+    if pgrep -u "$UID" -ix -- "$1" >/dev/null; then
+        notice "Se omite $2 porque está en uso en este equipo."
+        return 1
+    else
+        status=$?
+        [[ $status == 1 ]] || die "No se pudo consultar si $2 está en uso."
+    fi
+}
+
+# Vacía el contenido desde el directorio ya validado. Las operaciones relativas
+# al descriptor evitan seguir un enlace si una entrada cambia durante el recorrido.
+clean_contents() {
+    python3 -IS - "$mode" "$@" <<'PY'
+import errno
+import os
+import stat
+import sys
+
+apply = sys.argv[1] == "--clean"
+root = sys.argv[2]
+keep = {"huggingface/token", "huggingface/stored_tokens", *sys.argv[3:]}
+flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+markers = {".git", ".hg", ".svn", "pyvenv.cfg", "conda-meta"}
+uid = os.getuid()
+files = blocks = directories = 0
+remaining_links = {}
+
+def mount_id(fd):
+    with open(f"/proc/self/fdinfo/{fd}", encoding="ascii") as info:
+        return next(line for line in info if line.startswith("mnt_id:"))
+
+def clean(fd, relative, mount):
+    global files, blocks, directories
+    names = os.listdir(fd)
+    if markers.intersection(names) or {"HEAD", "objects", "refs"}.issubset(names):
+        return False
+    empty = True
+    for name in names:
+        path = os.path.join(relative, name)
+        if path in keep or name in {".venv", "venv"} or name.startswith(".nfs"):
+            empty = False
+            continue
+        try:
+            entry = os.stat(name, dir_fd=fd, follow_symlinks=False)
+            if entry.st_uid != uid:
+                empty = False
+            elif stat.S_ISDIR(entry.st_mode):
+                child = os.open(name, flags, dir_fd=fd)
+                try:
+                    removable = (os.path.samestat(entry, os.fstat(child))
+                                 and mount_id(child) == mount and clean(child, path, mount))
+                    if removable and apply:
+                        current = os.stat(name, dir_fd=fd, follow_symlinks=False)
+                        if os.path.samestat(entry, current):
+                            os.rmdir(name, dir_fd=fd)
+                        else:
+                            removable = False
+                finally:
+                    os.close(child)
+                if removable:
+                    directories += 1
+                else:
+                    empty = False
+            elif stat.S_ISREG(entry.st_mode) or stat.S_ISLNK(entry.st_mode):
+                if apply:
+                    os.unlink(name, dir_fd=fd)
+                files += 1
+                # Bun puede compartir un inodo con un node_modules o con otro
+                # archivo de la caché. Cuenta sus bloques al quitar el último enlace.
+                key = (entry.st_dev, entry.st_ino)
+                left = remaining_links.get(key, entry.st_nlink) - 1
+                if left:
+                    remaining_links[key] = left
+                else:
+                    remaining_links.pop(key, None)
+                    blocks += entry.st_blocks
+            else:
+                empty = False
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            empty = False
+            if exc.errno != errno.ENOTEMPTY:
+                print(f"Se omite {os.path.join(root, path)!r}: {exc.strerror}", file=sys.stderr)
+    return empty
+
+fd = os.open(".", flags)
+try:
+    if os.fstat(fd).st_uid == uid:
+        clean(fd, "", mount_id(fd))
+except OSError as exc:
+    print(f"Se omite {root!r}: {exc.strerror}", file=sys.stderr)
+finally:
+    os.close(fd)
+if files or directories:
+    print(f"{(blocks + 1) // 2} KiB\t{root!r} ({files} archivos y enlaces, {directories} directorios)")
+PY
+}
+
+clean_directory() (
+    local dir=$1 pattern=${2:-} root=$home src relative='' blocks name
+    local action=()
+    [[ -d $dir ]] || return 0
+    if [[ $dir == "$sgo/.cache" && -n $sgo_root ]]; then
+        relative=.cache
+    else
+        for src in "${!managed_dirs[@]}"; do
+            if [[ $dir == "$src" || $dir == "$src/"* ]]; then
+                relative="${managed_dirs[$src]}${dir#"$src"}"
+                [[ $(realpath -e -- "$src") == "$sgo_root/${managed_dirs[$src]}" ]] || return 0
+                break
+            fi
+        done
+    fi
+    if [[ -n $relative ]]; then
+        trusted_destination "$sgo/$relative" || return 0
+        root=$sgo_root
+        dir="$root/$relative"
+    fi
+    if ! plain_directory "$root" "$dir"; then
+        notice "Se omite el directorio enlazado o montado en $dir"
+        return 0
+    fi
+    # Mantiene una referencia al directorio aunque otra sesión lo renombre.
+    cd -P -- "$dir" || { notice "Se omite el directorio inaccesible $dir"; return 0; }
+    [[ $(pwd -P) == "$dir" ]] || return 0
+    if [[ $root == "$sgo_root" ]]; then
+        [[ $(stat -Lc '%d:%i' -- "$root") == "$sgo_identity" &&
+           $(stat -c %d -- .) == "${sgo_identity%:*}" ]] || return 0
+    fi
+    if [[ -z $pattern ]]; then
+        clean_contents "$dir" "${@:3}"
+        return
+    fi
+    if [[ $mode == --clean ]]; then action=(-delete); fi
+    LC_ALL=C find -P . -xdev -ignore_readdir_race -regextype posix-extended -mindepth 1 -maxdepth 1 \
+        -type f -uid "$UID" -links 1 -regex "\./($pattern)" \
+        "${action[@]}" -printf '%k\t%f\n' |
+        while IFS=$'\t' read -r blocks name; do
+            printf '%s KiB\t%q\n' "$blocks" "$dir/$name"
+        done
+)
+
+chromium_discards() {
+    local base dir
+    for base in "$@"; do
+        # Chromium aparta una caché anterior en old_Cache_Data_000..099.
+        for dir in "$base"/Cache/old_Cache_Data_0[0-9][0-9]; do
+            clean_directory "$dir" '[0-9a-f]{16}_[01s]'
+        done
+    done
+}
+
+clean_named_caches() {
+    local base=$1 name
+    shift
+    for name in "$@"; do clean_directory "$base/$name"; done
+}
+
+clean_browser_profiles() {
+    local base profile
+    for base in "$@"; do
+        [[ -d $base ]] || continue
+        clean_named_caches "$base" component_crx_cache extensions_crx_cache
+        for profile in "$base/Default" "$base"/Profile\ [0-9]*; do
+            [[ ${profile##*/} == Default || ${profile##*/} =~ ^Profile\ [0-9]+$ ]] || continue
+            clean_named_caches "$profile" Cache 'Code Cache' GPUCache 'File System' \
+                'Service Worker/ScriptCache' 'Service Worker/CacheStorage'
+        done
+    done
+}
+
+clean_extension_caches() {
+    local root="$home/.vscode/extensions" extension
+    [[ -n ${managed_dirs[$root]:-} || -n ${managed_dirs[$home/.vscode]:-} ]] || return 0
+    [[ -d $root ]] || return 0
+    [[ $(realpath -e -- "$root") == "$sgo_root/.vscode/extensions" ]] || return 0
+    plain_directory "$sgo_root" "$sgo_root/.vscode/extensions" || return 0
+    for extension in "$root"/*; do
+        [[ -d $extension && ! -L $extension && -f $extension/package.json &&
+           ! -L $extension/package.json ]] || continue
+        # Un directorio .cache de una extensión también puede contener índices
+        # distribuidos con ella. Solo se busca el formato de descarte conocido.
+        chromium_discards "$extension" "$extension/.cache" "$extension/cache" "$extension/dist/.cache"
+    done
+}
+
+# keep y busy_flatpaks también protegen estas aplicaciones en las dos reglas
+# generales (~/.cache y ~/.var/app/*/cache) que se aplican al final.
+clean_gui_caches() {
+    local kind=$1 label=$2 processes=$3 id=$4 base cache_name
+    shift 4
+    local -a roots=()
+    for base in "$@"; do
+        if [[ $base == "$home/.var/app/"* && $inspect_flatpaks == false ]]; then continue; fi
+        roots+=("$base")
+        # El perfil puede estar en uso desde otra máquina que comparte el home.
+        if present "$base/SingletonLock"; then
+            notice "Se omite $label porque existe un bloqueo de perfil en $base"
+            busy_flatpaks[$id]=1
+        fi
+    done
+    if ! app_closed "$processes" "$label"; then busy_flatpaks[$id]=1; fi
+    if [[ -n ${busy_flatpaks[$id]:-} ]]; then
+        for base in "${roots[@]}"; do
+            if [[ $base == "$home/.config/"* ]]; then
+                cache_name=${base#"$home/.config/"}
+                keep+=("${cache_name%%/*}")
+            fi
+        done
+        return 0
+    fi
+    for base in "${roots[@]}"; do
+        case $kind in
+            browser) clean_browser_profiles "$base" ;;
+            electron) clean_named_caches "$base" Cache 'Code Cache' GPUCache \
+                'Service Worker/ScriptCache' 'Service Worker/CacheStorage' ;;
+            editor) clean_named_caches "$base" Cache 'Code Cache' GPUCache CachedData CachedExtensionVSIXs ;;
+        esac
+    done
+}
+
+clean_app_caches() {
+    local dir id running
+    local -a keep=()
+    local -A busy_flatpaks=()
+    local inspect_flatpaks=true
+
+    # flatpak ps identifica también aplicaciones cuyo proceso tiene otro nombre.
+    if command -v flatpak >/dev/null; then
+        if running=$(flatpak ps --columns=application); then
+            while read -r id; do
+                if [[ -n $id ]]; then busy_flatpaks["$id"]=1; fi
+            done <<< "$running"
+        else
+            inspect_flatpaks=false
+            notice 'Se omiten las cachés Flatpak porque no se pudieron consultar las aplicaciones abiertas.'
+        fi
+    fi
+
+    clean_gui_caches browser Chrome 'chrome|google-chrome|chrome-beta|chrome-unstable' com.google.Chrome \
+        "$home/.config"/{google-chrome,google-chrome-beta,google-chrome-unstable} \
+        "$home/.var/app/com.google.Chrome/config/google-chrome"
+    clean_gui_caches browser Chromium 'chromium|chromium-browse' org.chromium.Chromium \
+        "$home/.config/chromium" "$home/snap/chromium/common/chromium" \
+        "$home/.var/app/org.chromium.Chromium/config/chromium"
+    if [[ -z ${busy_flatpaks[org.chromium.Chromium]:-} ]]; then clean_directory "$home/snap/chromium/common/.cache"; fi
+    clean_gui_caches browser Brave 'brave|brave-browser' com.brave.Browser \
+        "$home/.config/BraveSoftware/Brave-Browser" "$home/.var/app/com.brave.Browser/config/BraveSoftware/Brave-Browser"
+
+    if app_closed 'firefox|firefox-bin' Firefox && [[ -z ${busy_flatpaks[org.mozilla.firefox]:-} ]]; then
+        clean_directory "$home/snap/firefox/common/.cache"
+    else
+        keep+=(mozilla)
+        busy_flatpaks[org.mozilla.firefox]=1
+    fi
+    if ! app_closed 'spotify' Spotify; then busy_flatpaks[com.spotify.Client]=1; fi
+    if [[ -n ${busy_flatpaks[com.spotify.Client]:-} ]]; then keep+=(spotify); fi
+
+    clean_gui_caches electron Discord discord com.discordapp.Discord \
+        "$home/.config/discord" "$home/.var/app/com.discordapp.Discord/config/discord"
+    clean_gui_caches electron Slack slack com.slack.Slack \
+        "$home/.config/Slack" "$home/.var/app/com.slack.Slack/config/Slack"
+    if [[ -n ${busy_flatpaks[com.slack.Slack]:-} ]]; then keep+=(slack); fi
+    clean_gui_caches editor 'VS Code' "$code_processes" com.visualstudio.code \
+        "$home/.config/Code" "$home/.config/Code - Insiders" "$home/.config/Code - OSS" \
+        "$home/.var/app/com.visualstudio.code/config/Code"
+    clean_gui_caches editor VSCodium "$code_processes" com.vscodium.codium \
+        "$home/.config/VSCodium" "$home/.var/app/com.vscodium.codium/config/VSCodium"
+    if [[ -z ${busy_flatpaks[com.visualstudio.code]:-} && -z ${busy_flatpaks[com.vscodium.codium]:-} ]]; then
+        clean_extension_caches
+    else
+        keep+=(vscode-cpptools)
+    fi
+
+    if app_closed 'npm|npm .*|npx|npx .*' npm; then clean_directory "$home/.npm/_cacache"
+    else keep+=(npm); fi
+    if app_closed 'bun|bunx' Bun; then clean_directory "$home/.bun/install/cache"
+    else keep+=(bun); fi
+    if $inspect_flatpaks; then
+        for dir in "$home"/.var/app/*/cache; do
+            id=${dir%/cache}
+            id=${id##*/}
+            if [[ -z ${busy_flatpaks[$id]:-} ]]; then clean_directory "$dir"; fi
+        done
+    fi
+    clean_directory "$home/.cache" '' "${keep[@]}"
+    # El escritorio puede ejecutar --clean sin haber leído .zshrc.
+    if [[ -n $sgo_root && -z ${managed_dirs[$home/.cache]:-} ]] &&
+       { [[ ${XDG_CACHE_HOME:-} == "$sgo/.cache" ]] ||
+         { [[ -f $zshrc ]] && grep -Fxq -- "$env_begin" "$zshrc" && grep -Fxq -- "$env_end" "$zshrc"; }; }; then
+        clean_directory "$sgo/.cache" '' "${keep[@]}"
+    fi
+}
+
+# Sólo se crean destinos en un sistema de archivos distinto del home.
+# En algunos campus el montaje está en la carpeta personal, en otros en su padre.
+sgo_available() {
+    local probe="$HOME/sgoinfre" home_dev sgo_dev mount
+    [[ -d $probe && ! -L $sgo ]] || return 1
+    if present "$sgo"; then
+        [[ -d $sgo && -O $sgo ]] || return 1
+        probe=$sgo
+    fi
+    [[ -w $probe && -x $probe ]] || return 1
+    home_dev=$(stat -Lc %d -- "$home") && sgo_dev=$(stat -Lc %d -- "$probe") &&
+        mount=$(findmnt -nr -o TARGET -T "$probe") &&
+        [[ -n $mount && $mount != / && $home_dev != "$sgo_dev" ]]
+}
+
+# Dentro del directorio personal de sgoinfre se rechazan componentes enlazados
+# y directorios modificables por otros usuarios (aquí se ejecutan extensiones).
+trusted_destination() {
+    local path=$1 perms root physical mount
+    [[ $path == "$sgo" || $path == "$sgo/"* ]] || return 1
+    case "/${path#"$sgo"}/" in */../*|*/./*) return 1 ;; esac
+    if [[ -d $sgo ]]; then
+        root=$(realpath -e -- "$sgo") || return 1
+        physical="$root${path#"$sgo"}"
+        for mount in "${mounts[@]}"; do
+            [[ $mount == "$root/"* ]] || continue
+            [[ $physical != "$mount" && $physical != "$mount/"* ]] || return 1
+        done
+    fi
+    while [[ $path == "$sgo" || $path == "$sgo/"* ]]; do
+        if present "$path"; then
+            [[ -d $path && ! -L $path && -O $path ]] || return 1
+            perms=$(stat -c %a -- "$path") || return 1
+            (( (8#$perms & 0022) == 0 )) || return 1
+        fi
+        path=${path%/*}
+    done
+}
+
+# Crea únicamente la carpeta de la cuenta en el nivel compartido. Las demás
+# creaciones se hacen desde dentro de esa carpeta y con la máscara privada 077.
+ensure_sgo_directories() (
+    local dst
+    if ! sgo_available; then
+        if [[ $mode == --prepare-env ]]; then exit 1; fi
+        die 'sgoinfre no está montado como almacenamiento separado y escribible.'
+    fi
+    if ! present "$sgo"; then
+        cd -P -- "$HOME/sgoinfre"
+        mkdir -m 700 -- "$USER" || [[ -d $sgo && ! -L $sgo && -O $sgo ]] || exit 1
+        sgo_available || die "No se pudo verificar el montaje de $sgo"
+    fi
+    trusted_destination "$sgo" || die "Directorio personal no válido: $sgo"
+    cd -P -- "$sgo"
+    for dst in "$@"; do
+        trusted_destination "$dst" || die "Destino no válido en sgoinfre: $dst"
+        if [[ $dst != "$sgo" && ! -d $dst ]]; then mkdir -p -- "./${dst#"$sgo/"}"; fi
+    done
+)
+
+register_migrated_link() {
+    local src="$home/$1" relative=$2
+    [[ -L $src && -d $src ]] || return 0
+    [[ $(realpath -e -- "${src%/*}") == "${src%/*}" ]] || return 0
+    [[ $(realpath -e -- "$src") == "$sgo_root/$relative" ]] || return 0
+    trusted_destination "$sgo/$relative" || { notice "Se omite el destino con permisos o enlaces inesperados: $sgo/$relative"; return 0; }
+    managed_dirs["$src"]=$relative
+}
+
+repair_link() {
+    local src=$1 dst=$2
+    [[ -L $src && ! -e $src ]] || return 0
+    [[ $(realpath -e -- "${src%/*}") == "${src%/*}" ]] || return 0
+    [[ $(readlink -- "$src") == "$dst" ]] || return 0
+    trusted_destination "$dst" || die "Revisa el propietario, permisos y enlaces de $dst"
+    if [[ $mode == --dry-run ]]; then
+        printf 'Se recrearía el destino vacío de %s\n' "$src"
+    else
+        ensure_sgo_directories "$dst"
+        printf 'Destino vacío recreado para %s\n' "$src"
+    fi
+}
+
+repair_disposable_links() {
+    local name
+    repair_link "$home/.cache" "$sgo/.cache"
+    for name in Cache CachedData CachedExtensionVSIXs; do
+        repair_link "$home/.config/Code/$name" "$sgo/vscode_config/$name"
+    done
+    for name in .gemini .local/share .config/Code/User/workspaceStorage; do
+        if [[ -L $home/$name && ! -e $home/$name ]]; then
+            notice "Enlace a datos persistentes sin destino: $home/$name. Revisa tu copia de seguridad."
+        fi
+    done
+}
+
+check_cache_copy() {
+    # --existing comprueba solo las coincidencias antes de combinar. Sin él,
+    # cualquier archivo del original ausente o distinto impide retirarlo.
+    local src=$1 dst=$2 changes
+    shift 2
+    # Los directorios personales de destino pueden tener permisos más privados.
+    changes=$(rsync -rclpAXni --out-format='%i' "$@" -- "$src/" "$dst/" | awk '!/^[.]d/') ||
+        die 'No se pudo verificar la caché.'
+    [[ -z $changes ]] || die "Hay diferencias entre $src y $dst. Se conserva el original."
+}
+
+migrate_directory() (
+    local relative=$1 src="$home/$1" dst="$sgo/$1"
+    local parent=${src%/*} leaf=${src##*/} recovery_prefix=.fclean-original.
+    local staging backup link target resolved special merged=false
+    if [[ $relative == .cache ]]; then recovery_prefix=.fclean-cache-original.; fi
+    if [[ ! -L $parent ]]; then
+        for backup in "$parent/$recovery_prefix"*; do
+            die "Hay una migración anterior pendiente de revisar en $backup"
+        done
+    fi
+    if [[ -L $parent || -L $src ]]; then
+        link=$src
+        target=$dst
+        if [[ -L $parent ]]; then link=$parent; target="$sgo/.vscode"; fi
+        trusted_destination "$target" || die "Destino no válido para $link: $target"
+        if [[ $(realpath -m -- "$link") != "$(realpath -m -- "$target")" ]]; then
+            notice "Se omite $link porque ya apunta a otro destino: $(readlink -- "$link")"
+            [[ $mode == --dry-run ]] || exit 1
+            return 0
+        fi
+        if [[ $mode != --dry-run && ! -d $link ]]; then die "Enlace sin destino válido: $link"; fi
+        printf 'Se conserva el enlace existente: %s -> %s\n' "$link" "$(readlink -- "$link")"
+        return 0
+    fi
+    if [[ $parent != "$home" ]] && present "$parent"; then
+        plain_directory "$home" "$parent" || die "Directorio enlazado o montado: $parent"
+    fi
+    trusted_destination "$dst" || die "Revisa el propietario, permisos y enlaces de $dst"
+    if [[ -d $dst ]]; then
+        local base
+        base=$(realpath -e -- "$sgo")
+        plain_directory "$base" "$base/$relative" || die "Destino enlazado o con montajes: $dst"
+    fi
+    if present "$src"; then
+        plain_directory "$home" "$src" || die "Origen inesperado: $src"
+    fi
+    if [[ -d $src ]]; then
+        if [[ $relative == .cache ]]; then
+            special=$(find -P "$src" ! -type d ! -type f ! -type l -print -quit)
+            if [[ -n $special ]]; then
+                if [[ $mode == --dry-run ]]; then
+                    notice "Se omite la migración de caché mientras exista este archivo especial: $special"
+                    return 0
+                fi
+                die "Revisa el archivo especial antes de migrar la caché: $special"
+            fi
+        fi
+        # Las extensiones de desarrollo a veces apuntan a un proyecto vecino.
+        # Un enlace relativo que sale del árbol cambiaría al moverlo.
+        find -P "$src" -type l -printf '%p\0%l\0' |
+            while IFS= read -r -d '' link && IFS= read -r -d '' target; do
+                [[ $target != /* ]] || continue
+                resolved=$(realpath -ms -- "${link%/*}/$target")
+                [[ $resolved == "$src" || $resolved == "$src/"* ]] ||
+                    die "El enlace relativo $link apunta fuera de $src. Revisa su destino antes de migrar."
+            done
+    fi
+    if [[ $relative == .vscode/extensions && -d $src && -d $dst ]]; then
+        diff -qr --no-dereference -- "$src" "$dst" ||
+            die "Ya hay extensiones distintas en $dst. Se conservan ambas carpetas."
+    fi
+    if [[ $mode == --dry-run ]]; then
+        printf 'Migración opcional: %s -> %s\n' "$src" "$dst"
+        if [[ -d $src ]]; then du -shx -- "$src"; fi
+        return 0
+    fi
+    ensure_sgo_directories "${dst%/*}"
+    if [[ $relative == .cache && -d $src && -d $dst ]]; then
+        command -v rsync >/dev/null || die "Se necesita rsync para combinar las cachés de $src y $dst."
+        check_cache_copy "$src" "$dst" --existing
+        rsync -aHAX --ignore-existing --chmod=Du+rwx,Dgo-rwx -- "$src/" "$dst/"
+        check_cache_copy "$src" "$dst"
+        merged=true
+    fi
+    mkdir -p -- "$parent"
+    if [[ ! -d $dst ]]; then
+        staging=$(mktemp -d -- "${dst%/*}/.fclean-copia.XXXXXXXX")
+        trap 'rm -rf --one-file-system -- "$staging"' EXIT
+        mkdir -- "$staging/data"
+        if [[ -d $src ]]; then
+            cp -a -- "$src/." "$staging/data/"
+            diff -qr --no-dereference -- "$src" "$staging/data" || die 'La copia no coincide con el original.'
+            chmod 700 -- "$staging/data"
+        fi
+        mv -nT -- "$staging/data" "$dst"
+        [[ ! -d $staging/data ]] || die "Otro proceso creó $dst durante la copia."
+        rmdir -- "$staging"
+        trap - EXIT
+    fi
+    if [[ -d $src ]]; then
+        backup=$(mktemp -d -- "$parent/${recovery_prefix}XXXXXXXX")
+        printf 'Original de recuperación durante la migración: %s/%s\n' "$backup" "$leaf"
+        # Si la verificación final o la creación del enlace falla, restaura
+        # el nombre original siempre que otra sesión no lo haya ocupado.
+        trap 'if present "$backup/$leaf" && ! present "$src"; then mv -nT -- "$backup/$leaf" "$src"; fi
+              if ! present "$backup/$leaf"; then rmdir -- "$backup"; fi' EXIT
+        mv -T -- "$src" "$backup/$leaf"
+        if $merged; then
+            check_cache_copy "$backup/$leaf" "$dst"
+        else
+            diff -qr --no-dereference -- "$backup/$leaf" "$dst" ||
+                die "El original cambió durante la migración. Se conserva la copia de sgoinfre en $dst"
+        fi
+        ln -sT -- "$dst" "$src"
+        trap - EXIT
+        rm -rf --one-file-system -- "$backup"
+    else
+        ln -sT -- "$dst" "$src"
+    fi
+    printf 'Directorio migrado y enlazado: %s -> %s\n' "$src" "$dst"
+)
+
+code_processes='code|code-oss|code-insiders|codium'
+case $mode in
+    --prepare-env)
+        ensure_sgo_directories "$sgo/.cache/uv" "$sgo/.cache/huggingface" "$sgo/.local/share"
+        exit 0 ;;
+    --migrate-cache)
+        sgo_available || die "No se pudo verificar el almacenamiento de $sgo"
+        if [[ -d $home/.cache && ! -L $home/.cache ]]; then
+            app_closed "$code_processes|chrome|chromium|brave|firefox|firefox-bin|slack|discord|spotify|uv|bun|npm" \
+                'una aplicación que usa la caché' || exit 1
+        fi
+        repair_link "$home/.cache" "$sgo/.cache"
+        migrate_directory .cache
+        exit 0 ;;
+esac
+declare -A managed_dirs=()
+sgo_root=''
+sgo_identity=''
+if [[ $mode != --migrate && -d $sgo ]] && sgo_available; then
+    sgo_root=$(realpath -e -- "$sgo")
+    sgo_identity=$(stat -Lc '%d:%i' -- "$sgo_root")
+    register_migrated_link .cache .cache
+    register_migrated_link .config/Code/Cache vscode_config/Cache
+    register_migrated_link .config/Code/CachedData vscode_config/CachedData
+    register_migrated_link .config/Code/CachedExtensionVSIXs vscode_config/CachedExtensionVSIXs
+    if [[ -L $home/.vscode ]]; then register_migrated_link .vscode .vscode
+    else register_migrated_link .vscode/extensions .vscode/extensions
+    fi
+fi
+if has_legacy_block "$zshrc"; then
+    notice 'El bloque antiguo sigue activo. Usa --install para retirarlo con copia de seguridad.'
+fi
+if [[ $mode != --migrate ]]; then
+    if [[ $mode == --dry-run ]]; then printf 'Contenido que se eliminaría:\n'
+    else printf 'Contenido eliminado:\n'
+    fi
+    clean_app_caches | awk '{ print } END { if (!NR) print "No se encontró contenido que limpiar." }'
+fi
+if ! sgo_available; then
+    notice "No se pudo verificar $sgo como almacenamiento separado y escribible."
+    [[ $mode != --migrate ]] || exit 1
+    exit 0
+fi
+if [[ $mode != --migrate ]]; then repair_disposable_links; fi
+if app_closed "$code_processes" 'VS Code'; then
+    repair_link "$home/.vscode" "$sgo/.vscode"
+    repair_link "$home/.vscode/extensions" "$sgo/.vscode/extensions"
+    if [[ $mode != --clean ]]; then migrate_directory .vscode/extensions; fi
+elif [[ $mode == --migrate ]]; then
+    exit 1
+fi
+if [[ $mode == --dry-run ]]; then migrate_directory .cache; fi
