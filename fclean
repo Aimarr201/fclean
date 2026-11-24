@@ -7,21 +7,27 @@ shopt -s nullglob
 usage() {
     cat <<'HELP'
 Uso: bash fclean [opción]
-  --dry-run     Muestra las cachés y el almacenamiento web que se vaciarían,
+  --dry-run     Muestra las cachés, la papelera y los datos web que se vaciarían,
                 su tamaño y la migración opcional. Es la opción por defecto.
-  --clean       Vacía esas rutas en el home y en los destinos migrados.
+  --clean       Vacía esas rutas e inicia el seguimiento de venvs de proyectos.
+                Borra el venv tras 5 días sin actividad del entorno ni del proyecto.
+  --fclean      Limpia las cachés conocidas incluso con aplicaciones abiertas y
+                conserva las extensiones instaladas de VS Code. Vacía .cache en
+                el home y en sgoinfre. Elimina también los venvs reconocidos
+                aunque estén en uso o tengan .fclean-keep.
   --migrate     Mueve las extensiones de VS Code a ~/sgoinfre/USUARIO.
   --migrate-cache  Conserva el contenido de ~/.cache y enlaza la carpeta a
                 $HOME/sgoinfre/$USER/.cache. Cierra las apps que la utilizan.
                 Si ya hay una caché en ambos sitios, usa rsync para combinarlas.
   --install     Instala --clean al iniciar la sesión gráfica y configura en
                 ~/.zshrc las rutas de XDG, uv y Hugging Face para sgoinfre.
-  --uninstall   Desactiva el inicio automático y retira los exports de fclean.
+  --uninstall   Retira el inicio automático, los exports y el seguimiento de venvs.
   --help        Muestra esta ayuda.
 
 Cierra VS Code en todos los equipos que compartan tu home antes de migrar.
 Si el campus vacía sgoinfre, tendrás que reinstalar las extensiones.
-La limpieza incluye los datos web locales de File System y CacheStorage y conserva la papelera.
+La limpieza vacía la papelera y las cachés indicadas incluso con aplicaciones abiertas.
+File System y CacheStorage pueden contener trabajo local de aplicaciones web.
 Las descargas almacenadas en caché pueden volver a necesitar conexión.
 HELP
 }
@@ -34,7 +40,7 @@ present() { [[ -e $1 || -L $1 ]]; }
 mode=${1:---dry-run}
 case $mode in
     --help|-h) usage; exit 0 ;;
-    --dry-run|--clean|--migrate|--migrate-cache|--install|--uninstall|--prepare-env) ;;
+    --dry-run|--clean|--fclean|--migrate|--migrate-cache|--install|--uninstall|--prepare-env) ;;
     *) usage >&2; exit 2 ;;
 esac
 
@@ -168,7 +174,7 @@ case $mode in
         update_zshrc uninstall
         if present "$desktop"; then rm -- "$desktop"; fi
         printf 'Inicio automático desactivado.\n'
-        exit 0 ;;
+        ;;
 esac
 
 # Protege también montajes bind, que pueden tener el mismo número de dispositivo.
@@ -199,6 +205,361 @@ app_closed() {
     fi
 }
 
+# Examina los archivos como datos, sin ejecutar el intérprete del entorno.
+inspect_home_venvs() {
+    python3 -IS - "$home" "$mode" "${mounts[@]}" <<'PY'
+import collections
+import os
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+
+home, mode = sys.argv[1:3]
+force = mode == "--fclean"
+mounts = set(sys.argv[3:])
+uid = os.getuid()
+device = os.stat(home).st_dev
+pruned = mounts | {os.path.join(home, "sgoinfre"), os.path.join(home, "goinfre")}
+if force:
+    # Algunas extensiones distribuyen su propio intérprete y paquetes Python.
+    pruned.update(os.path.join(home, editor, "extensions") for editor in (
+        ".vscode", ".vscode-insiders", ".vscode-oss", ".vscode-server", ".vscode-server-insiders",
+    ))
+    if os.environ.get("VSCODE_EXTENSIONS"):
+        pruned.add(os.path.realpath(os.environ["VSCODE_EXTENSIONS"]))
+if not force:
+    pruned.update(os.path.join(home, path) for path in (
+        ".cache", ".local/share/Trash", ".npm/_cacache", ".bun/install/cache",
+        ".local/share/pypoetry/venv", ".local/share/pipx", ".local/pipx", ".local/share/uv/tools",
+    ))
+venv_entries = {"bin", "include", "lib", "lib64", "share", "etc", "pyvenv.cfg",
+                ".gitignore", ".Python", "CACHEDIR.TAG", ".fclean-keep"}
+if force:
+    venv_entries.update({"pipx_metadata.json", "uv-receipt.toml", ".lock"})
+cutoff = time.time() - 5 * 24 * 60 * 60
+module = "_fclean_venv_usage_v1.py"
+startup = "fclean_venv_usage_v1.pth"
+running = ".fclean-running-"
+hook = b'''# Seguimiento de uso de este venv por fclean.
+import atexit
+import os
+import tempfile
+
+def _record():
+    site = os.path.dirname(__file__)
+    stamp = os.path.join(site, "fclean_venv_usage_v1.pth")
+    os.utime(stamp, follow_symlinks=False)
+    pid = os.getpid()
+    with open("/proc/sys/kernel/random/boot_id", encoding="ascii") as stream:
+        boot = stream.read().strip()
+    fd, token = tempfile.mkstemp(prefix=f".fclean-running-{boot}.{pid}.", dir=site)
+    os.close(fd)
+    def finished():
+        if os.getpid() != pid:
+            return
+        try:
+            os.utime(stamp, follow_symlinks=False)
+        except OSError:
+            pass
+        try:
+            os.unlink(token)
+        except OSError:
+            pass
+    atexit.register(finished)
+
+def _try_record():
+    try:
+        _record()
+    except OSError:
+        pass
+
+_try_record()
+os.register_at_fork(after_in_child=_try_record)
+'''
+managed = {module: hook, startup: b"import _fclean_venv_usage_v1\n"}
+
+def venv_site(path, entries):
+    if not {"bin", "lib", "pyvenv.cfg"} <= entries or (mode != "--uninstall" and not entries <= venv_entries):
+        return False  # Por ejemplo, python -m venv . dentro de un proyecto con código.
+    config = os.path.join(path, "pyvenv.cfg")
+    if not stat.S_ISREG(os.lstat(config).st_mode):
+        return False
+    for name in ("bin", "lib"):
+        if not stat.S_ISDIR(os.lstat(os.path.join(path, name)).st_mode):
+            return False
+    python = os.path.join(path, "bin", "python")
+    if not os.path.isfile(python) or not os.access(python, os.X_OK):
+        return False
+    with os.fdopen(os.open(config, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK), "rb") as cfg:
+        info = os.fstat(cfg.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != uid or info.st_size > 32768:
+            return False
+        content = cfg.read(32769)
+        if (not re.search(rb"(?mi)^home[ \t]*=[ \t]*/", content) or
+                not re.search(rb"(?mi)^include-system-site-packages[ \t]*=[ \t]*(true|false)[ \t\r]*$", content)):
+            return False
+    sites = []
+    for version in os.listdir(os.path.join(path, "lib")):
+        if re.fullmatch(r"python3\.\d+t?", version):
+            version_dir = os.path.join(path, "lib", version)
+            site = os.path.join(version_dir, "site-packages")
+            if not os.path.islink(version_dir) and os.path.isdir(site) and not os.path.islink(site):
+                sites.append(site)
+    return sites[0] if len(sites) == 1 else None
+
+def raise_scan_error(exc):
+    raise exc
+
+def project_for(path):
+    parent = os.path.dirname(path)
+    nearest = None
+    while parent != home:
+        if os.path.lexists(os.path.join(parent, ".git")):
+            return parent
+        if nearest is None and (any(os.path.isfile(os.path.join(parent, name)) for name in
+                ("pyproject.toml", "requirements.txt", "Pipfile", "setup.py", "setup.cfg"))
+                or (parent == os.path.dirname(path) and any(n.endswith(".py") for n in os.listdir(parent)))):
+            nearest = parent
+        parent = os.path.dirname(parent)
+    return nearest
+
+def trusted_site(path, site):
+    current = site
+    while current != os.path.dirname(path):
+        info = os.lstat(current)
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != uid or (not force and info.st_mode & 0o022):
+            return False
+        current = os.path.dirname(current)
+    return os.path.realpath(path) == path
+
+def tracking_files(site_fd, create, remove):
+    missing = []
+    for name, expected in managed.items():
+        try:
+            fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=site_fd)
+        except FileNotFoundError:
+            missing.append(name)
+            continue
+        with os.fdopen(fd, "rb") as stream:
+            info = os.fstat(fd)
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != uid or info.st_nlink != 1
+                    or info.st_mode & 0o022 or stream.read(len(expected) + 1) != expected):
+                raise ValueError(f"archivo de seguimiento ajeno o modificado: {name!r}")
+    if remove:
+        for name in reversed(list(managed)):
+            if name not in missing:
+                os.unlink(name, dir_fd=site_fd)
+    elif create:
+        for name in missing:  # El módulo se instala antes que el archivo de arranque.
+            with tempfile.NamedTemporaryFile(dir=f"/proc/self/fd/{site_fd}", prefix=".fclean-install-") as stream:
+                stream.write(managed[name])
+                stream.flush()
+                os.link(stream.name, name, dst_dir_fd=site_fd)
+    return not missing
+
+def check_tracking(site, create=False, remove=False):
+    fd = os.open(site, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        if os.readlink(f"/proc/self/fd/{fd}") != site:
+            raise ValueError("el directorio de paquetes cambió durante la comprobación")
+        return tracking_files(fd, create, remove)
+    finally:
+        os.close(fd)
+
+def running_sessions(site):
+    tokens = [n for n in os.listdir(site) if n.startswith(running)]
+    if not tokens:
+        return False
+    with open("/proc/sys/kernel/random/boot_id", encoding="ascii") as stream:
+        prefix = running + stream.read().strip() + "."
+    for name in tokens:
+        pid = name[len(prefix):].split(".", 1)[0]
+        if mode == "--clean" and name.startswith(prefix) and pid.isdecimal() and not os.path.exists("/proc/" + pid):
+            # Un cierre abrupto en este puesto. Dar cinco días desde que se detecta.
+            os.utime(os.path.join(site, startup), follow_symlinks=False)
+            os.unlink(os.path.join(site, name))
+    return True
+
+def active_locally(path, project):
+    if os.path.realpath(os.environ.get("VIRTUAL_ENV", "")) == path:
+        return True
+    for pid in os.listdir("/proc"):
+        if not pid.isdecimal():
+            continue
+        proc = os.path.join("/proc", pid)
+        try:
+            if os.stat(proc).st_uid != uid:
+                continue
+            cwd = os.readlink(proc + "/cwd")
+            if cwd == project or cwd.startswith(project + "/"):
+                return True
+            with open(proc + "/cmdline", "rb") as stream:
+                args = stream.read().split(b"\0")
+            project_arg = os.fsencode(project)
+            if any(arg == project_arg or arg.startswith(project_arg + b"/") for arg in args):
+                return True
+            with open(proc + "/environ", "rb") as stream:
+                if b"VIRTUAL_ENV=" + os.fsencode(path) in stream.read().split(b"\0"):
+                    return True
+        except (FileNotFoundError, ProcessLookupError, PermissionError):
+            continue
+    return False
+
+def project_quiet(project, env, staging=None):
+    for base, dirs, files in os.walk(project, onerror=raise_scan_error, followlinks=False):
+        dirs[:] = [n for n in dirs if os.path.join(base, n) not in (env, staging)]
+        for name in ([""] if base == project else []) + dirs + files:
+            item = os.path.join(base, name) if name else base
+            if staging and item == os.path.dirname(env):
+                continue  # Acabamos de mover el venv dentro de este mismo directorio.
+            info = os.lstat(item)
+            last = max(info.st_mtime, info.st_ctime)
+            if stat.S_ISREG(info.st_mode) and name not in {"pyvenv.cfg", module, startup}:
+                last = max(last, info.st_atime)
+            if item in mounts or info.st_dev != device or name == ".fclean-keep" or last > cutoff:
+                return False
+    return True
+
+def eligible_size(path, site, moved=False):
+    # Una consulta de fclean puede leer estos tres archivos. Su atime no mide uso.
+    metadata = {os.path.join(path, "pyvenv.cfg"), *(os.path.join(site, n) for n in managed)}
+    links = collections.Counter()
+    blocks = 0
+    for base, dirs, files in os.walk(path, onerror=raise_scan_error, followlinks=False):
+        if base != path and {".git", ".hg", ".svn", "conda-meta", "pyvenv.cfg"}.intersection(dirs + files):
+            return None
+        for name in ([None] if base == path else []) + dirs + files:
+            child = os.path.join(base, name) if name is not None else base
+            info = os.lstat(child)
+            if info.st_uid != uid or info.st_dev != device or child in mounts or (name or "").startswith(".nfs"):
+                return None
+            if not force:
+                # El rename final cambia el ctime de la raíz aunque su contenido sea idéntico.
+                latest = info.st_mtime if moved and child == path else max(info.st_mtime, info.st_ctime)
+                if stat.S_ISREG(info.st_mode) and child not in metadata:
+                    latest = max(latest, info.st_atime)
+                if latest > cutoff or (name or "").startswith(running) or name == ".fclean-keep":
+                    return None
+            if not (stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode)):
+                return None
+            if stat.S_ISDIR(info.st_mode):
+                blocks += info.st_blocks
+            else:
+                links[info.st_ino] += 1
+                if links[info.st_ino] == info.st_nlink:
+                    blocks += info.st_blocks
+    return (blocks + 1) // 2
+
+def contains_mount(path):
+    # La tabla inicial podría haber cambiado. Incluye bind mounts del mismo dispositivo.
+    escaped = os.fsencode(path)
+    for raw, mount_escape in ((b"\\", br"\134"), (b" ", br"\040"), (b"\t", br"\011"), (b"\n", br"\012")):
+        escaped = escaped.replace(raw, mount_escape)
+    with open("/proc/self/mountinfo", "rb") as stream:
+        for line in stream:
+            mount = line.split()[4]
+            if mount == escaped or mount.startswith(escaped + b"/"):
+                return True
+    return False
+
+def inactive_project(path, site):
+    project = project_for(path)
+    if not project:
+        if mode == "--dry-run":
+            print(f"Venv conservado sin proyecto identificable: {path!r}", file=sys.stderr)
+        return
+    if any(os.path.lexists(os.path.join(p, ".fclean-keep")) for p in (path, project)):
+        return
+    if not check_tracking(site, mode == "--clean"):
+        action = "Seguimiento iniciado" if mode == "--clean" else "Se iniciaría el seguimiento"
+        print(f"{action} para {path!r} (plazo de 5 días completos).", file=sys.stderr)
+        return
+    stamp = os.path.join(site, startup)
+    if os.stat(stamp).st_mtime > cutoff or running_sessions(site) or active_locally(path, project):
+        return
+    if not project_quiet(project, path):
+        return
+    return project
+
+def process_venv(path, site, identity):
+    if not trusted_site(path, site):
+        if mode == "--dry-run":
+            print(f"Venv conservado por sus permisos o enlaces: {path!r}", file=sys.stderr)
+        return
+    if mode == "--uninstall":
+        check_tracking(site, remove=True)
+        return
+    project = None if force else inactive_project(path, site)
+    if not force and not project:
+        return
+    size = eligible_size(path, site)
+    if size is None:
+        return
+    if mode in ("--clean", "--fclean"):
+        # Apartar el directorio permite verificar su identidad antes del borrado.
+        parent = os.path.dirname(path)
+        staging = tempfile.mkdtemp(prefix=".fclean-venv-", dir=parent)
+        moved = os.path.join(staging, "venv")
+        try:
+            os.rename(path, moved)
+            moved_site = os.path.join(moved, os.path.relpath(site, path))
+            if (not os.path.samestat(identity, os.lstat(moved)) or contains_mount(moved) or
+                    not trusted_site(moved, moved_site) or not set(os.listdir(moved)) <= venv_entries or
+                    eligible_size(moved, moved_site, moved=True) is None):
+                raise ValueError("el entorno cambió durante la limpieza")
+            if not force and (not project_quiet(project, path, staging) or not check_tracking(moved_site) or
+                    os.stat(os.path.join(moved_site, startup)).st_mtime > cutoff):
+                raise ValueError("el seguimiento o el proyecto cambió durante la limpieza")
+            shutil.rmtree(moved)
+        finally:
+            if os.path.lexists(moved):
+                subprocess.run(["mv", "-nT", "--", moved, path], check=False)
+                if os.path.lexists(moved):
+                    print(f"Original de recuperación: {moved!r}", file=sys.stderr)
+            if not os.path.lexists(moved):
+                os.rmdir(staging)
+    reason = "venv, limpieza manual" if force else "venv y proyecto sin actividad observable durante 5 días"
+    print(f"{size}\t{path!r} ({reason})")
+
+def scan_error(exc):
+    print(f"Se omite la búsqueda de venvs en {exc.filename!r}: {exc.strerror}", file=sys.stderr)
+
+for path, dirs, files in os.walk(home, onerror=scan_error, followlinks=False):
+    try:
+        entry = os.lstat(path)
+        if not stat.S_ISDIR(entry.st_mode) or entry.st_dev != device or entry.st_uid != uid:
+            dirs.clear()
+            continue
+        if force and os.path.basename(os.path.dirname(path)) == "extensions" and "package.json" in files:
+            dirs.clear()
+            continue
+        if path != home and "pyvenv.cfg" in files:
+            entries = set(dirs + files)
+            site = venv_site(path, entries)
+            if site and not any(m == path or m.startswith(path + "/") for m in mounts):
+                dirs.clear()
+                process_venv(path, site, entry)
+                continue
+        dirs[:] = [d for d in dirs if d not in {".git", ".hg", ".svn"}
+                   and not d.startswith(".fclean-venv-")
+                   and os.path.join(path, d) not in pruned
+                   and (force or (d != "node_modules" and
+                        not (d == "cache" and os.path.dirname(path) == os.path.join(home, ".var/app"))))]
+    except OSError as exc:
+        scan_error(exc)
+        dirs.clear()
+    except ValueError as exc:
+        print(f"Se conserva {path!r}: {exc}", file=sys.stderr)
+        dirs.clear()
+PY
+}
+
+if [[ $mode == --uninstall ]]; then inspect_home_venvs; exit 0; fi
+
 # Vacía el contenido desde el directorio ya validado. Las operaciones relativas
 # al descriptor evitan seguir un enlace si una entrada cambia durante el recorrido.
 clean_contents() {
@@ -208,9 +569,14 @@ import os
 import stat
 import sys
 
-apply = sys.argv[1] == "--clean"
+apply = sys.argv[1] in ("--clean", "--fclean")
 root = sys.argv[2]
-keep = {"huggingface/token", "huggingface/stored_tokens", *sys.argv[3:]}
+# La regla carpeta/* selecciona entradas visibles en la raíz y todo lo que contienen.
+visible_children = sys.argv[3] == "*"
+full_tree = sys.argv[3] == "all"
+guarded = not (visible_children or full_tree)
+in_trash = sys.argv[4] == "trash"
+keep = {"huggingface/token", "huggingface/stored_tokens"}
 flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
 markers = {".git", ".hg", ".svn", "pyvenv.cfg", "conda-meta"}
 uid = os.getuid()
@@ -224,12 +590,15 @@ def mount_id(fd):
 def clean(fd, relative, mount):
     global files, blocks, directories
     names = os.listdir(fd)
-    if markers.intersection(names) or {"HEAD", "objects", "refs"}.issubset(names):
+    if "pyvenv.cfg" in names and not (in_trash or full_tree):
+        return False
+    if guarded and (markers.intersection(names) or {"HEAD", "objects", "refs"}.issubset(names)):
         return False
     empty = True
     for name in names:
         path = os.path.join(relative, name)
-        if path in keep or name in {".venv", "venv"} or name.startswith(".nfs"):
+        if (name.startswith(".nfs") or (visible_children and not relative and name.startswith("."))
+                or (guarded and (path in keep or name in {".venv", "venv"}))):
             empty = False
             continue
         try:
@@ -251,9 +620,10 @@ def clean(fd, relative, mount):
                     os.close(child)
                 if removable:
                     directories += 1
+                    blocks += entry.st_blocks
                 else:
                     empty = False
-            elif stat.S_ISREG(entry.st_mode) or stat.S_ISLNK(entry.st_mode):
+            elif not guarded or stat.S_ISREG(entry.st_mode) or stat.S_ISLNK(entry.st_mode):
                 if apply:
                     os.unlink(name, dir_fd=fd)
                 files += 1
@@ -292,9 +662,9 @@ PY
 clean_directory() (
     local dir=$1 pattern=${2:-} root=$home src relative='' blocks name
     local action=()
-    [[ -d $dir ]] || return 0
-    if [[ $dir == "$sgo/.cache" && -n $sgo_root ]]; then
-        relative=.cache
+    [[ -d $dir && -z ${listed_dirs[$dir]:-} ]] || return 0
+    if [[ -n $sgo_root && ( $dir == "$sgo/.cache" || $dir == "$sgo/.vscode/extensions/"* ) ]]; then
+        relative=${dir#"$sgo/"}
     else
         for src in "${!managed_dirs[@]}"; do
             if [[ $dir == "$src" || $dir == "$src/"* ]]; then
@@ -320,11 +690,15 @@ clean_directory() (
         [[ $(stat -Lc '%d:%i' -- "$root") == "$sgo_identity" &&
            $(stat -c %d -- .) == "${sgo_identity%:*}" ]] || return 0
     fi
-    if [[ -z $pattern ]]; then
-        clean_contents "$dir" "${@:3}"
+    if [[ -z $pattern || $pattern == '*' || $pattern == all ]]; then
+        if [[ $1 == "$home/.local/share/Trash" ]]; then
+            clean_contents "$dir" "$pattern" trash
+        else
+            clean_contents "$dir" "$pattern" cache
+        fi
         return
     fi
-    if [[ $mode == --clean ]]; then action=(-delete); fi
+    if [[ $mode != --dry-run ]]; then action=(-delete); fi
     LC_ALL=C find -P . -xdev -ignore_readdir_race -regextype posix-extended -mindepth 1 -maxdepth 1 \
         -type f -uid "$UID" -links 1 -regex "\./($pattern)" \
         "${action[@]}" -printf '%k\t%f\n' |
@@ -349,6 +723,16 @@ clean_named_caches() {
     for name in "$@"; do clean_directory "$base/$name"; done
 }
 
+# Las dos copias pueden coexistir antes de migrar o después de quitar un enlace.
+clean_general_cache() {
+    local src="$home/.cache" dst="$sgo/.cache" pattern=$1
+    if [[ -n $sgo_root && -d $dst ]] && trusted_destination "$dst"; then
+        clean_directory "$dst" "$pattern"
+        if [[ $src -ef $dst ]]; then return 0; fi
+    fi
+    clean_directory "$src" "$pattern"
+}
+
 clean_browser_profiles() {
     local base profile
     for base in "$@"; do
@@ -363,45 +747,44 @@ clean_browser_profiles() {
 }
 
 clean_extension_caches() {
-    local root="$home/.vscode/extensions" extension
-    [[ -n ${managed_dirs[$root]:-} || -n ${managed_dirs[$home/.vscode]:-} ]] || return 0
-    [[ -d $root ]] || return 0
-    [[ $(realpath -e -- "$root") == "$sgo_root/.vscode/extensions" ]] || return 0
-    plain_directory "$sgo_root" "$sgo_root/.vscode/extensions" || return 0
-    for extension in "$root"/*; do
-        [[ -d $extension && ! -L $extension && -f $extension/package.json &&
-           ! -L $extension/package.json ]] || continue
-        # Un directorio .cache de una extensión también puede contener índices
-        # distribuidos con ella. Solo se busca el formato de descarte conocido.
-        chromium_discards "$extension" "$extension/.cache" "$extension/cache" "$extension/dist/.cache"
+    local installed_ext="$home/.vscode/extensions" root extension
+    local -a roots=()
+    if [[ $mode == --fclean ]]; then
+        if plain_directory "$home" "$installed_ext"; then roots+=("$installed_ext"); fi
+    else
+        [[ -n ${managed_dirs[$installed_ext]:-} || -n ${managed_dirs[$home/.vscode]:-} ]] || return 0
+        [[ $(realpath -e -- "$installed_ext") == "$sgo_root/.vscode/extensions" ]] || return 0
+    fi
+    if [[ -n $sgo_root ]] && trusted_destination "$sgo/.vscode/extensions" &&
+       plain_directory "$sgo_root" "$sgo_root/.vscode/extensions"; then
+        roots+=("$sgo/.vscode/extensions")
+    fi
+    for root in "${roots[@]}"; do
+        for extension in "$root"/*; do
+            [[ -d $extension && ! -L $extension && -f $extension/package.json &&
+               ! -L $extension/package.json ]] || continue
+            # Una extensión puede distribuir índices en .cache. Solo tocar descartes conocidos.
+            chromium_discards "$extension" "$extension/.cache" "$extension/cache" "$extension/dist/.cache"
+        done
     done
 }
 
-# keep y busy_flatpaks también protegen estas aplicaciones en las dos reglas
-# generales (~/.cache y ~/.var/app/*/cache) que se aplican al final.
+# La limpieza normal respeta los procesos y bloqueos de perfil.
 clean_gui_caches() {
-    local kind=$1 label=$2 processes=$3 id=$4 base cache_name
+    local kind=$1 label=$2 processes=$3 id=$4 base
     shift 4
     local -a roots=()
     for base in "$@"; do
         if [[ $base == "$home/.var/app/"* && $inspect_flatpaks == false ]]; then continue; fi
         roots+=("$base")
         # El perfil puede estar en uso desde otra máquina que comparte el home.
-        if present "$base/SingletonLock"; then
-            notice "Se omite $label porque existe un bloqueo de perfil en $base"
+        if [[ $mode != --fclean ]] && present "$base/SingletonLock"; then
+            notice "Se omiten las cachés adicionales de $label por el bloqueo de perfil en $base"
             busy_flatpaks[$id]=1
         fi
     done
-    if ! app_closed "$processes" "$label"; then busy_flatpaks[$id]=1; fi
-    if [[ -n ${busy_flatpaks[$id]:-} ]]; then
-        for base in "${roots[@]}"; do
-            if [[ $base == "$home/.config/"* ]]; then
-                cache_name=${base#"$home/.config/"}
-                keep+=("${cache_name%%/*}")
-            fi
-        done
-        return 0
-    fi
+    if [[ $mode != --fclean ]] && ! app_closed "$processes" "el resto de las cachés de $label"; then busy_flatpaks[$id]=1; fi
+    [[ -z ${busy_flatpaks[$id]:-} ]] || return 0
     for base in "${roots[@]}"; do
         case $kind in
             browser) clean_browser_profiles "$base" ;;
@@ -413,20 +796,42 @@ clean_gui_caches() {
 }
 
 clean_app_caches() {
-    local dir id running
-    local -a keep=()
+    local dir id running profile
+    local apps="$home/.var/app"
+    local chrome="$apps/com.google.Chrome/config/google-chrome"
+    local code="$apps/com.visualstudio.code/config/Code"
+    local -A listed_dirs=()
     local -A busy_flatpaks=()
     local inspect_flatpaks=true
+    local -a targets=(
+        "$home/.local/share/Trash" "$home/.npm/_cacache" "$home/.bun/install/cache"
+        "$apps"/*/cache "$chrome/component_crx_cache" "$chrome/extensions_crx_cache"
+        "$code/Cache" "$code/CachedData" "$code/CachedExtensionVSIXs"
+        "$apps/com.discordapp.Discord/config/discord/Cache"
+    )
+    for profile in "$chrome/Default" "$chrome"/Profile\ [0-9]; do
+        targets+=("$profile/File System" "$profile/Service Worker/CacheStorage" "$profile/Service Worker/ScriptCache")
+    done
+    if [[ $mode == --fclean ]]; then
+        clean_general_cache all
+    else
+        clean_general_cache '*'
+    fi
+    for dir in "${targets[@]}"; do
+        clean_directory "$dir" '*'
+        # Las reglas adicionales no deben repetir la ruta ni contarla en la vista previa.
+        listed_dirs["$dir"]=1
+    done
 
     # flatpak ps identifica también aplicaciones cuyo proceso tiene otro nombre.
-    if command -v flatpak >/dev/null; then
+    if [[ $mode != --fclean ]] && command -v flatpak >/dev/null; then
         if running=$(flatpak ps --columns=application); then
             while read -r id; do
                 if [[ -n $id ]]; then busy_flatpaks["$id"]=1; fi
             done <<< "$running"
         else
             inspect_flatpaks=false
-            notice 'Se omiten las cachés Flatpak porque no se pudieron consultar las aplicaciones abiertas.'
+            notice 'Se omiten las cachés adicionales de Flatpak porque no se pudieron consultar las aplicaciones abiertas.'
         fi
     fi
 
@@ -440,20 +845,15 @@ clean_app_caches() {
     clean_gui_caches browser Brave 'brave|brave-browser' com.brave.Browser \
         "$home/.config/BraveSoftware/Brave-Browser" "$home/.var/app/com.brave.Browser/config/BraveSoftware/Brave-Browser"
 
-    if app_closed 'firefox|firefox-bin' Firefox && [[ -z ${busy_flatpaks[org.mozilla.firefox]:-} ]]; then
+    if [[ $mode == --fclean ]] || { app_closed 'firefox|firefox-bin' 'la caché Snap de Firefox' &&
+                                     [[ -z ${busy_flatpaks[org.mozilla.firefox]:-} ]]; }; then
         clean_directory "$home/snap/firefox/common/.cache"
-    else
-        keep+=(mozilla)
-        busy_flatpaks[org.mozilla.firefox]=1
     fi
-    if ! app_closed 'spotify' Spotify; then busy_flatpaks[com.spotify.Client]=1; fi
-    if [[ -n ${busy_flatpaks[com.spotify.Client]:-} ]]; then keep+=(spotify); fi
 
     clean_gui_caches electron Discord discord com.discordapp.Discord \
         "$home/.config/discord" "$home/.var/app/com.discordapp.Discord/config/discord"
     clean_gui_caches electron Slack slack com.slack.Slack \
         "$home/.config/Slack" "$home/.var/app/com.slack.Slack/config/Slack"
-    if [[ -n ${busy_flatpaks[com.slack.Slack]:-} ]]; then keep+=(slack); fi
     clean_gui_caches editor 'VS Code' "$code_processes" com.visualstudio.code \
         "$home/.config/Code" "$home/.config/Code - Insiders" "$home/.config/Code - OSS" \
         "$home/.var/app/com.visualstudio.code/config/Code"
@@ -461,27 +861,6 @@ clean_app_caches() {
         "$home/.config/VSCodium" "$home/.var/app/com.vscodium.codium/config/VSCodium"
     if [[ -z ${busy_flatpaks[com.visualstudio.code]:-} && -z ${busy_flatpaks[com.vscodium.codium]:-} ]]; then
         clean_extension_caches
-    else
-        keep+=(vscode-cpptools)
-    fi
-
-    if app_closed 'npm|npm .*|npx|npx .*' npm; then clean_directory "$home/.npm/_cacache"
-    else keep+=(npm); fi
-    if app_closed 'bun|bunx' Bun; then clean_directory "$home/.bun/install/cache"
-    else keep+=(bun); fi
-    if $inspect_flatpaks; then
-        for dir in "$home"/.var/app/*/cache; do
-            id=${dir%/cache}
-            id=${id##*/}
-            if [[ -z ${busy_flatpaks[$id]:-} ]]; then clean_directory "$dir"; fi
-        done
-    fi
-    clean_directory "$home/.cache" '' "${keep[@]}"
-    # El escritorio puede ejecutar --clean sin haber leído .zshrc.
-    if [[ -n $sgo_root && -z ${managed_dirs[$home/.cache]:-} ]] &&
-       { [[ ${XDG_CACHE_HOME:-} == "$sgo/.cache" ]] ||
-         { [[ -f $zshrc ]] && grep -Fxq -- "$env_begin" "$zshrc" && grep -Fxq -- "$env_end" "$zshrc"; }; }; then
-        clean_directory "$sgo/.cache" '' "${keep[@]}"
     fi
 }
 
@@ -726,6 +1105,7 @@ if [[ $mode != --migrate && -d $sgo ]] && sgo_available; then
     sgo_root=$(realpath -e -- "$sgo")
     sgo_identity=$(stat -Lc '%d:%i' -- "$sgo_root")
     register_migrated_link .cache .cache
+    register_migrated_link .local/share .local/share
     register_migrated_link .config/Code/Cache vscode_config/Cache
     register_migrated_link .config/Code/CachedData vscode_config/CachedData
     register_migrated_link .config/Code/CachedExtensionVSIXs vscode_config/CachedExtensionVSIXs
@@ -804,16 +1184,18 @@ if [[ $mode != --migrate ]]; then
         printf 'Contenido eliminado:\n'
     fi
     any_cleaned=false
+    exec {report_fd}< <(clean_app_caches; inspect_home_venvs)
+    report_pid=$!
     while IFS=$'\t' read -r size_spec rest || [[ -n $size_spec ]]; do
         [[ -n $size_spec ]] || continue
         any_cleaned=true
         if [[ $size_spec =~ ^([0-9]+)$ ]]; then
             kib=${BASH_REMATCH[1]}
-            (( total_cleaned_kib += kib ))
+            total_cleaned_kib=$((total_cleaned_kib + kib))
             formatted=$(format_size "$kib")
         elif [[ $size_spec =~ ^([0-9]+)[[:space:]]*KiB$ ]]; then
             kib=${BASH_REMATCH[1]}
-            (( total_cleaned_kib += kib ))
+            total_cleaned_kib=$((total_cleaned_kib + kib))
             formatted=$(format_size "$kib")
         else
             formatted=$size_spec
@@ -823,7 +1205,9 @@ if [[ $mode != --migrate ]]; then
         else
             printf '%s\n' "$formatted"
         fi
-    done < <(clean_app_caches)
+    done <&"$report_fd"
+    exec {report_fd}<&-
+    wait "$report_pid" || die 'No se pudo completar el recorrido de limpieza.'
     if ! $any_cleaned; then
         printf 'No se encontró contenido que limpiar.\n'
     fi
@@ -833,15 +1217,15 @@ if ! sgo_available; then
     [[ $mode != --migrate ]] || exit 1
 else
     if [[ $mode != --migrate ]]; then repair_disposable_links; fi
-    if app_closed "$code_processes" 'VS Code'; then
+    if app_closed "$code_processes" 'la gestión de enlaces de VS Code'; then
         repair_link "$home/.vscode" "$sgo/.vscode"
         repair_link "$home/.vscode/extensions" "$sgo/.vscode/extensions"
-        if [[ $mode != --clean ]]; then migrate_directory .vscode/extensions; fi
+        if [[ $mode == --migrate || $mode == --dry-run ]]; then migrate_directory .vscode/extensions; fi
     elif [[ $mode == --migrate ]]; then
         exit 1
     fi
     if [[ $mode == --dry-run ]]; then migrate_directory .cache; fi
 fi
-if [[ $mode == --clean ]]; then
+if [[ $mode == --clean || $mode == --fclean ]]; then
     print_clean_summary "$total_cleaned_kib"
 fi
