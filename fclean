@@ -6,29 +6,18 @@ shopt -s nullglob
 
 usage() {
     cat <<'HELP'
-Uso: bash fclean [opción]
-  --dry-run     Muestra las cachés, la papelera y los datos web que se vaciarían,
-                su tamaño y la migración opcional. Es la opción por defecto.
-  --clean       Vacía esas rutas e inicia el seguimiento de venvs de proyectos.
-                Borra el venv tras 5 días sin actividad del entorno ni del proyecto.
-  --fclean      Limpia las cachés conocidas incluso con aplicaciones abiertas y
-                conserva las extensiones instaladas de VS Code. Vacía .cache en
-                el home y en sgoinfre. Elimina también los venvs reconocidos
-                aunque estén en uso o tengan .fclean-keep.
-  --migrate     Mueve las extensiones de VS Code a ~/sgoinfre/USUARIO.
-  --migrate-cache  Conserva el contenido de ~/.cache y enlaza la carpeta a
-                $HOME/sgoinfre/$USER/.cache. Cierra las apps que la utilizan.
-                Si ya hay una caché en ambos sitios, usa rsync para combinarlas.
-  --install     Instala --clean al iniciar la sesión gráfica y configura en
-                ~/.zshrc las rutas de XDG, uv y Hugging Face para sgoinfre.
-  --uninstall   Retira el inicio automático, los exports y el seguimiento de venvs.
-  --help        Muestra esta ayuda.
+Uso: fclean [opción] o bash fclean [opción]
 
-Cierra VS Code en todos los equipos que compartan tu home antes de migrar.
-Si el campus vacía sgoinfre, tendrás que reinstalar las extensiones.
-La limpieza vacía la papelera y las cachés indicadas incluso con aplicaciones abiertas.
-File System y CacheStorage pueden contener trabajo local de aplicaciones web.
-Las descargas almacenadas en caché pueden volver a necesitar conexión.
+  --dry-run        Muestra qué se limpiaría y qué puede migrarse.
+  --clean          Vacía cachés y papelera. Borra venvs tras 5 días de inactividad.
+  --fclean         Fuerza la limpieza y borra venvs reconocidos, incluso activos.
+  --migrate        Traslada las extensiones de VS Code a sgoinfre.
+  --migrate-cache  Traslada ~/.cache a sgoinfre.
+  --install        Configura el alias en Zsh y la limpieza al iniciar sesión.
+  --uninstall      Retira la configuración y el seguimiento de venvs.
+  -h, --help       Muestra esta ayuda, también disponible sin opciones.
+
+La limpieza borra datos sin confirmación. Cierra las aplicaciones antes de migrar.
 HELP
 }
 
@@ -37,7 +26,7 @@ notice() { printf '%s\n' "$*" >&2; }
 present() { [[ -e $1 || -L $1 ]]; }
 
 (( $# <= 1 )) || { usage >&2; exit 2; }
-mode=${1:---dry-run}
+mode=${1:---help}
 case $mode in
     --help|-h) usage; exit 0 ;;
     --dry-run|--clean|--fclean|--migrate|--migrate-cache|--install|--uninstall|--prepare-env) ;;
@@ -57,7 +46,7 @@ config=${XDG_CONFIG_HOME:-$HOME/.config}
 installed="$config/fclean/fclean"
 desktop="$config/autostart/42-fclean.desktop"
 marker='# Gestionado por 42-fclean'
-zshrc="$HOME/.zshrc"
+zshrc="${ZDOTDIR:-$HOME}/.zshrc"
 begin='# >>> 42-SGOINFRE-SHIELD >>>'
 end='# <<< 42-SGOINFRE-SHIELD <<<'
 env_begin='# >>> fclean: entorno sgoinfre >>>'
@@ -77,8 +66,10 @@ has_legacy_block() {
 }
 
 write_zsh_block() {
+    local installed_command
+    printf -v installed_command '/bin/bash %q' "$installed"
     printf '%s\n' "$env_begin"
-    printf 'if /bin/bash %q --prepare-env; then\n' "$installed"
+    printf 'if %s --prepare-env; then\n' "$installed_command"
     cat <<'ZSH'
     SGO="$HOME/sgoinfre/$USER"
     export XDG_CACHE_HOME="$SGO/.cache"
@@ -94,17 +85,21 @@ else
     if [[ ${SGO:-} == "$HOME/sgoinfre/${USER:-}" ]]; then unset SGO; fi
 fi
 ZSH
+    printf 'alias fclean=%q\n' "$installed_command"
     printf '%s\n' "$env_end"
 }
 
 update_zshrc() (
-    local action=$1 file=$zshrc input=/dev/null tmp backup block=''
+    local action=$1 file=$2 input=/dev/null tmp backup block=''
+    [[ $file == /* ]] || die 'ZDOTDIR debe ser una ruta absoluta.'
+    if [[ $action == uninstall && ! -e $file ]]; then return 0; fi
     if present "$file"; then
         [[ -f $file ]] || die "Ruta de configuración inesperada: $file"
         file=$(realpath -e -- "$file")
         input=$file
         if [[ $action == uninstall ]] && ! grep -Fxq -e "$env_begin" -e "$env_end" -- "$file"; then return 0; fi
-    elif [[ $action == uninstall ]]; then return 0
+    else
+        mkdir -p -- "${file%/*}"
     fi
     tmp=$(mktemp -- "${file}.fclean.XXXXXXXX")
     trap 'rm -f -- "$tmp"' EXIT
@@ -144,7 +139,10 @@ install_autostart() (
         [[ -f $desktop && ! -L $desktop ]] && grep -Fxq -- "$marker" "$desktop" ||
             die "Ya existe una entrada ajena en $desktop"
     fi
-    [[ $dir != *$'\n'* && $dir != *$'\r'* ]] || die 'Ruta de configuración incompatible con el inicio automático.'
+    # Path fija el directorio de trabajo para el inicio automático.
+    path=${dir//\\/\\\\}
+    path=${path//$'\t'/\\t}
+    [[ $path != *[[:cntrl:]]* ]] || die 'Ruta de configuración incompatible con el inicio automático.'
     mkdir -p -- "$dir" "${desktop%/*}"
     if present "$installed"; then
         [[ -f $installed && ! -L $installed ]] && grep -Fxq -- '# fclean para las sesiones de usuario de Ubuntu del campus 42.' "$installed" ||
@@ -155,11 +153,9 @@ install_autostart() (
     entry=$(mktemp -- "${desktop%/*}/.42-fclean.XXXXXXXX")
     trap 'rm -f -- "$tmp" "$entry"' EXIT
     cp -- "${BASH_SOURCE[0]}" "$tmp"
-    # Path fija el directorio de trabajo; Exec no necesita expandir HOME.
-    path=${dir//\\/\\\\}
     printf '[Desktop Entry]\n%s\nType=Application\nName=fclean 42\nPath=%s\nExec=/bin/bash ./fclean --clean\nTerminal=false\n' "$marker" "$path" > "$entry"
+    update_zshrc install "$zshrc"
     mv -T -- "$tmp" "$installed"
-    update_zshrc install
     mv -T -- "$entry" "$desktop"
     printf 'Inicio automático instalado en %s\n' "$desktop"
 )
@@ -171,7 +167,8 @@ case $mode in
             [[ -f $desktop && ! -L $desktop ]] && grep -Fxq -- "$marker" "$desktop" ||
                 die "La entrada $desktop no pertenece a fclean."
         fi
-        update_zshrc uninstall
+        update_zshrc uninstall "$zshrc"
+        if [[ $zshrc != "$HOME/.zshrc" ]]; then update_zshrc uninstall "$HOME/.zshrc"; fi
         if present "$desktop"; then rm -- "$desktop"; fi
         printf 'Inicio automático desactivado.\n'
         ;;
@@ -934,11 +931,18 @@ register_migrated_link() {
 }
 
 repair_link() {
-    local src=$1 dst=$2
+    local src=$1 dst=$2 resolved expected
     [[ -L $src && ! -e $src ]] || return 0
     [[ $(realpath -e -- "${src%/*}") == "${src%/*}" ]] || return 0
-    [[ $(readlink -- "$src") == "$dst" ]] || return 0
-    trusted_destination "$dst" || die "Revisa el propietario, permisos y enlaces de $dst"
+    resolved=$(realpath -m -- "$src") && expected=$(realpath -m -- "$dst") || return 0
+    [[ $resolved == "$expected" ]] || return 0
+    if ! trusted_destination "$dst"; then
+        if [[ $mode == --migrate || $mode == --migrate-cache ]]; then
+            die "Revisa el propietario, permisos y enlaces de $dst"
+        fi
+        notice "Se omite la reparación de $src por los permisos o enlaces de $dst"
+        return 0
+    fi
     if [[ $mode == --dry-run ]]; then
         printf 'Se recrearía el destino vacío de %s\n' "$src"
     else
@@ -1032,18 +1036,20 @@ migrate_directory() (
         diff -qr --no-dereference -- "$src" "$dst" ||
             die "Ya hay extensiones distintas en $dst. Se conservan ambas carpetas."
     fi
+    if [[ $mode != --dry-run ]]; then ensure_sgo_directories "${dst%/*}"; fi
+    if [[ $relative == .cache && -d $src && -d $dst ]]; then
+        command -v rsync >/dev/null || die "Se necesita rsync para combinar las cachés de $src y $dst."
+        check_cache_copy "$src" "$dst" --existing
+        if [[ $mode != --dry-run ]]; then
+            rsync -aHAX --ignore-existing --chmod=Du+rwx,Dgo-rwx -- "$src/" "$dst/"
+            check_cache_copy "$src" "$dst"
+            merged=true
+        fi
+    fi
     if [[ $mode == --dry-run ]]; then
         printf 'Migración opcional: %s -> %s\n' "$src" "$dst"
         if [[ -d $src ]]; then du -shx -- "$src"; fi
         return 0
-    fi
-    ensure_sgo_directories "${dst%/*}"
-    if [[ $relative == .cache && -d $src && -d $dst ]]; then
-        command -v rsync >/dev/null || die "Se necesita rsync para combinar las cachés de $src y $dst."
-        check_cache_copy "$src" "$dst" --existing
-        rsync -aHAX --ignore-existing --chmod=Du+rwx,Dgo-rwx -- "$src/" "$dst/"
-        check_cache_copy "$src" "$dst"
-        merged=true
     fi
     mkdir -p -- "$parent"
     if [[ ! -d $dst ]]; then
@@ -1082,6 +1088,12 @@ migrate_directory() (
     fi
     printf 'Directorio migrado y enlazado: %s -> %s\n' "$src" "$dst"
 )
+
+preview_migration() {
+    # Cada comprobación conserva errexit aunque su fallo no detenga la vista previa.
+    migrate_directory "$1" &
+    wait "$!" || notice "Se omite la migración opcional de $1."
+}
 
 code_processes='code|code-oss|code-insiders|codium'
 case $mode in
@@ -1220,11 +1232,14 @@ else
     if app_closed "$code_processes" 'la gestión de enlaces de VS Code'; then
         repair_link "$home/.vscode" "$sgo/.vscode"
         repair_link "$home/.vscode/extensions" "$sgo/.vscode/extensions"
-        if [[ $mode == --migrate || $mode == --dry-run ]]; then migrate_directory .vscode/extensions; fi
+        case $mode in
+            --migrate) migrate_directory .vscode/extensions ;;
+            --dry-run) preview_migration .vscode/extensions ;;
+        esac
     elif [[ $mode == --migrate ]]; then
         exit 1
     fi
-    if [[ $mode == --dry-run ]]; then migrate_directory .cache; fi
+    if [[ $mode == --dry-run ]]; then preview_migration .cache; fi
 fi
 if [[ $mode == --clean || $mode == --fclean ]]; then
     print_clean_summary "$total_cleaned_kib"

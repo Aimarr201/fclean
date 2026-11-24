@@ -27,20 +27,22 @@ bash fclean --install
 
 La primera limpieza automática ocurre en el siguiente inicio de sesión gráfica. Si quieres limpiar ahora, ejecuta `bash fclean --clean`. **Ambas formas vacían la papelera sin confirmación.**
 
+Después de instalar, abre una nueva terminal Zsh para usar `fclean` desde cualquier carpeta. `fclean` muestra la ayuda, `fclean --dry-run` muestra la vista previa y `fclean --clean` ejecuta la limpieza. Puedes cargar el alias en una sesión Zsh que ya esté abierta con `source "${ZDOTDIR:-$HOME}/.zshrc"`.
+
 ## Opciones
 
 El script acepta una opción por ejecución.
 
 | Opción | Qué hace |
 | --- | --- |
-| Sin opción o `--dry-run` | Muestra qué limpiaría y qué podría migrarse. Es una operación de solo lectura. |
+| `--dry-run` | Muestra qué limpiaría y qué podría migrarse. Es una operación de solo lectura. |
 | `--clean` | Vacía las rutas seleccionadas y limpia los entornos Python de proyectos que cumplen la regla de cinco días. |
 | `--fclean` | Limpia las cachés conocidas aunque las aplicaciones estén abiertas y conserva las extensiones instaladas de VS Code. Borra los venvs reconocidos en el home sin esperar cinco días. Se ejecuta manualmente. |
 | `--migrate-cache` | Copia y verifica `~/.cache` antes de sustituirla por un enlace a `$HOME/sgoinfre/$USER/.cache`. Si ambas carpetas existen, usa `rsync` para combinarlas y se detiene si encuentra un conflicto. |
 | `--migrate` | Copia y verifica `~/.vscode/extensions` y deja un enlace a `$HOME/sgoinfre/$USER/.vscode/extensions`. Si las extensiones de origen y destino difieren, conserva ambas carpetas. |
-| `--install` | Instala o actualiza la copia del script, registra `--clean` en el inicio de sesión gráfica y configura el entorno de Zsh. |
+| `--install` | Instala o actualiza la copia del script, registra `--clean` en el inicio de sesión gráfica y añade el alias `fclean` y las rutas de sgoinfre al archivo `.zshrc`. |
 | `--uninstall` | Retira el inicio automático, el bloque de Zsh y los archivos de arranque de seguimiento que reconoce en los venvs del home. |
-| `--help` o `-h` | Muestra la ayuda. |
+| Sin opción, `--help` o `-h` | Muestra la ayuda. |
 
 ## Qué se borra en cada limpieza
 
@@ -96,7 +98,7 @@ En Ubuntu puedes comprobar ambas opciones con `python3 -m unittest discover -s t
 
 Todo lo que el script escribe en `sgoinfre` queda bajo `$HOME/sgoinfre/$USER`. Antes de escribir, comprueba que el almacenamiento es distinto del home y que se puede escribir en él. Si falta el montaje, la limpieza local sigue disponible y las migraciones se detienen.
 
-Al abrir una nueva terminal Zsh después de instalar, el bloque de `~/.zshrc` prepara los directorios y, si están disponibles, aplica estas variables.
+Al abrir una nueva terminal Zsh después de instalar, el bloque de `.zshrc` prepara los directorios y, si están disponibles, aplica estas variables.
 
 ```bash
 SGO="$HOME/sgoinfre/$USER"
@@ -112,6 +114,6 @@ Las limpiezas posteriores vacían también la caché trasladada o configurada po
 
 ## Actualizar o desactivar
 
-Cuando cambies de versión, vuelve a ejecutar `bash fclean --install` desde la copia nueva. Por defecto, la copia instalada está en `~/.config/fclean/fclean` y la entrada de inicio en `~/.config/autostart/42-fclean.desktop`. Si has definido `XDG_CONFIG_HOME`, ambas rutas parten de ese directorio. Cuando modifica un `~/.zshrc` existente, el instalador guarda una copia junto al archivo.
+Cuando cambies de versión, vuelve a ejecutar `bash fclean --install` desde la copia nueva. Por defecto, la copia instalada está en `~/.config/fclean/fclean` y la entrada de inicio en `~/.config/autostart/42-fclean.desktop`. Si has definido `XDG_CONFIG_HOME`, ambas rutas parten de ese directorio. El instalador usa `~/.zshrc` por defecto. Si exportas `ZDOTDIR`, indica una ruta absoluta para que use `$ZDOTDIR/.zshrc`. Al modificar un archivo existente, guarda una copia junto a él.
 
-Para desactivar la limpieza automática y retirar los exports, ejecuta `bash fclean --uninstall`.
+Para desactivar la limpieza automática y retirar el alias y los exports de Zsh, ejecuta `bash fclean --uninstall` con el mismo `ZDOTDIR` que usaste al instalar.
