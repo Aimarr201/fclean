@@ -1,6 +1,7 @@
 """Pruebas de la CLI con un home desechable en Ubuntu."""
 
 import configparser
+import json
 import os
 import shlex
 import shutil
@@ -40,6 +41,7 @@ class CleanLocationsTests(unittest.TestCase):
             self.env.pop(name, None)
         self.stub("pgrep", "exit 1")
         self.stub("flatpak", "exit 0")
+        self.stub("curl", "exit 1")
 
     def stub(self, name, body):
         command = self.commands / name
@@ -78,6 +80,95 @@ class CleanLocationsTests(unittest.TestCase):
         path.write_text(content)
         return path
 
+    def stub_update_server(self):
+        self.stub("curl", r'''
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --output) output=$2; shift ;;
+        --etag-save) etag=$2; shift ;;
+        --etag-compare) sent=$(cat "$2"); shift ;;
+        https://*) url=$1 ;;
+    esac
+    shift
+done
+printf '%s %s\n' "$url" "${sent:-sin-etag}" >> "$HOME/update-requests"
+status=$(cat "$HOME/update-status")
+case "$status" in
+    200) cp "$HOME/upstream-script" "$output"; printf '"revision-2"\n' > "$etag" ;;
+    304) ;;
+    *) exit 1 ;;
+esac
+printf '%s' "$status"
+''')
+
+    def test_installed_clean_updates_once_and_falls_back_to_the_last_copy(self):
+        self.stub_update_server()
+        self.run_cli("--install")
+        installed = self.home / ".config/fclean/fclean"
+        upstream = installed.read_text().replace("Contenido eliminado:", "Limpieza desde la actualización:")
+        self.put("upstream-script", upstream)
+        self.put("update-status", "200")
+        cached = self.put(".cache/temporal")
+        result = self.run_command("bash", installed, "--clean")
+        self.assertIn("fclean actualizado", result.stderr)
+        self.assertIn("Limpieza desde la actualización:", result.stdout)
+        self.assertFalse(cached.exists())
+        self.assertEqual(installed.read_text(), upstream)
+        requests = self.home / "update-requests"
+        url = "https://raw.githubusercontent.com/Aimarr201/fclean/main/fclean"
+        self.assertEqual(requests.read_text().splitlines(), [f"{url} sin-etag"])
+        self.put("update-status", "304")
+        self.assertIn("Limpieza desde la actualización:", self.run_command("bash", installed, "--clean").stdout)
+        self.assertEqual(requests.read_text().splitlines()[-1], f'{url} "revision-2"')
+        self.run_command("bash", installed, "--dry-run")
+        self.run_command("bash", installed, "--fclean")
+        self.assertEqual(len(requests.read_text().splitlines()), 2)
+        self.put("upstream-script", upstream + "\nif\n")
+        for status in ("200", "503"):
+            with self.subTest(status=status):
+                self.put("update-status", status)
+                cached = self.put(".cache/temporal")
+                result = self.run_command("bash", installed, "--clean")
+                self.assertIn("No se pudo actualizar", result.stderr)
+                self.assertIn("Limpieza desde la actualización:", result.stdout)
+                self.assertEqual(installed.read_text(), upstream)
+                self.assertFalse(cached.exists())
+
+    def test_manual_clean_uses_an_updated_runtime_copy_without_replacing_source(self):
+        self.stub_update_server()
+        original = SCRIPT.read_text()
+        source = self.put("descarga/fclean", original)
+        self.put("upstream-script", original.replace("Contenido eliminado:", "Limpieza actualizada:"))
+        status = self.put("update-status", "200")
+        for response in ("200", "304", "503"):
+            with self.subTest(response=response):
+                status.write_text(response)
+                result = self.run_command("bash", source, "--clean")
+                self.assertIn("Limpieza actualizada:", result.stdout)
+                self.assertEqual(source.read_text(), original)
+        self.assertEqual(len((self.home / "update-requests").read_text().splitlines()), 3)
+
+    @unittest.skipUnless(shutil.which("git"), "requiere Git para probar cambios del repositorio")
+    def test_clean_preserves_worktree_edits(self):
+        self.stub_update_server()
+        original = SCRIPT.read_text()
+        source = self.put("repositorio/fclean", original)
+        repo = source.parent
+        self.run_command("git", "init", "-q", cwd=repo)
+        self.run_command("git", "add", "fclean", cwd=repo)
+        self.run_command("git", "-c", "user.name=Pruebas", "-c", "user.email=pruebas@example.invalid",
+                         "-c", "commit.gpgsign=false", "commit", "-qm", "Versión original", cwd=repo)
+        self.put("update-status", "200")
+        self.put("upstream-script", original.replace("Contenido eliminado:", "Versión remota:"))
+        edited = original.replace("Contenido eliminado:", "Versión local:")
+        source.write_text(edited)
+        self.assertIn("Versión local:", self.run_command("bash", source, "--clean").stdout)
+        self.assertEqual(source.read_text(), edited)
+        self.assertFalse((self.home / "update-requests").exists())
+        source.write_text(original)
+        self.assertIn("Versión remota:", self.run_command("bash", source, "--clean").stdout)
+        self.assertEqual(self.run_command("git", "status", "--porcelain", cwd=repo).stdout, "")
+
     def test_unmigrated_cache_without_sgoinfre(self):
         cache = self.home / ".cache"
         cache.mkdir()
@@ -105,10 +196,6 @@ class CleanLocationsTests(unittest.TestCase):
             (discarded / "0123456789abcdef_0").touch()
             (discarded / "indice-incluido").touch()
         self.run_cli("--clean")
-        for base in (self.home, personal):
-            self.assertEqual([p.name for p in (base / ".cache").iterdir()], [".oculto"])
-            self.assertTrue((base / ".vscode/extensions/visible").exists())
-        self.run_cli("--fclean")
         for base in (self.home, personal):
             self.assertEqual(list((base / ".cache").iterdir()), [])
             extensions = base / ".vscode/extensions"
@@ -142,7 +229,79 @@ class CleanLocationsTests(unittest.TestCase):
         self.assertEqual(list((personal / ".cache").iterdir()), [])
         self.assertTrue((personal / ".vscode/extensions/visible").is_file())
 
-    def test_fclean_cleans_busy_applications_and_preserves_profile(self):
+    def test_clean_removes_marked_extensions_and_keeps_registered_versions(self):
+        extensions = self.home / ".vscode/extensions"
+        for version in ("1.0.0", "2.0.0", "3.0.0"):
+            key = f"ejemplo.editor-{version}"
+            self.put(f".vscode/extensions/{key}/package.json",
+                     json.dumps({"publisher": "ejemplo", "name": "editor", "version": version}))
+            self.put(f".vscode/extensions/{key}/.oculto")
+        obsolete = self.put(".vscode/extensions/.obsolete", json.dumps({
+            "ejemplo.editor-1.0.0": True, "ejemplo.editor-2.0.0": True,
+            "ejemplo.editor-3.0.0": False, "../../unrelated": True,
+        }))
+        self.put(".vscode/extensions/extensions.json", json.dumps([{"relativeLocation": "ejemplo.editor-2.0.0"}]))
+        marked = obsolete.read_text()
+        candidate = extensions / "ejemplo.editor-1.0.0"
+        preview = self.run_cli("--dry-run").stdout
+        self.assertIn("ejemplo.editor-1.0.0", preview)
+        self.assertNotIn("ejemplo.editor-2.0.0", preview)
+        self.assertTrue((candidate / ".oculto").is_file())
+        manifest = (candidate / "package.json").read_text()
+        self.assertIn("extensión marcada en .obsolete", self.run_cli("--clean").stdout)
+        self.assertFalse(candidate.exists())
+        self.put(".vscode/extensions/ejemplo.editor-1.0.0/package.json", manifest)
+        self.assertIn("extensión marcada en .obsolete", self.run_cli("--fclean").stdout)
+        self.assertFalse(candidate.exists())
+        self.assertTrue((extensions / "ejemplo.editor-2.0.0/.oculto").is_file())
+        self.assertTrue((extensions / "ejemplo.editor-3.0.0/.oculto").is_file())
+        self.assertEqual(obsolete.read_text(), marked)
+        self.assertNotIn("extensión marcada en .obsolete", self.run_cli("--clean").stdout)
+
+    def test_obsolete_extensions_clean_with_editor_open_and_preserve_registered_versions(self):
+        personal = self.mount_sgoinfre()
+        (self.home / ".vscode").symlink_to(personal / ".vscode", target_is_directory=True)
+        keys = [f"ejemplo.editor-{version}.0.0-linux-x64" for version in (1, 2, 3)]
+        for version, key in enumerate(keys, 1):
+            self.put(f".vscode/extensions/{key}/package.json", json.dumps({
+                "publisher": "ejemplo", "name": "editor", "version": f"{version}.0.0",
+                "__metadata": {"targetPlatform": "linux-x64"},
+            }), base=personal)
+        self.put(".vscode/extensions/.obsolete", json.dumps(dict.fromkeys(keys, True)), base=personal)
+        self.put(".config/Code/User/profiles/perfil/extensions.json",
+                 json.dumps([{"location": {"path": str(self.home / ".vscode/extensions" / keys[1])}}]))
+        nfs = self.put(f".vscode/extensions/{keys[2]}/.nfs123", base=personal)
+        outside = self.put("otro/archivo")
+        (personal / ".vscode/extensions" / keys[0] / "enlace").symlink_to(outside)
+        candidate = personal / ".vscode/extensions" / keys[0]
+        self.stub("pgrep", "exit 0")
+        lock = self.home / ".config/Code/SingletonLock"
+        lock.symlink_to("otro-equipo-1234")
+        self.assertIn(keys[0], self.run_cli("--dry-run").stdout)
+        self.run_cli("--clean")
+        self.assertFalse(candidate.exists())
+        self.assertTrue(lock.is_symlink())
+        self.assertTrue(outside.is_file())
+        self.assertTrue((personal / ".vscode/extensions" / keys[1]).is_dir())
+        self.assertTrue(nfs.is_file())
+        self.assertTrue(nfs.with_name("package.json").is_file())
+
+    def test_invalid_obsolete_metadata_skips_extension_removal(self):
+        candidate = self.put(".vscode/extensions/ejemplo.editor-1.0.0/package.json",
+                             '{"publisher":"ejemplo","name":"editor","version":"1.0.0"}')
+        obsolete = self.put(".vscode/extensions/.obsolete", "[")
+        cached = self.put(".cache/temporal")
+        result = self.run_cli("--clean")
+        self.assertIn("Se omite", result.stderr)
+        self.assertFalse(cached.exists())
+        self.assertTrue(candidate.is_file())
+        obsolete.write_text('{"ejemplo.editor-1.0.0":true}')
+        self.put(".vscode/extensions/extensions.json", "{")
+        result = self.run_cli("--clean")
+        self.assertIn("Se omite", result.stderr)
+        self.assertTrue(candidate.is_file())
+
+    def test_both_cleanup_modes_clean_busy_applications_and_preserve_profiles(self):
         self.stub("pgrep", "exit 0")
         self.stub("flatpak", "echo com.slack.Slack")
         targets = (
@@ -153,39 +312,35 @@ class CleanLocationsTests(unittest.TestCase):
             "snap/firefox/common/.cache",
             "snap/chromium/common/.cache",
         )
-        for relative in targets:
-            directory = self.home / relative
-            directory.mkdir(parents=True)
-            (directory / "cached").write_bytes(b"datos")
+        (self.home / ".config/google-chrome/Default").mkdir(parents=True)
         lock = self.home / ".config/google-chrome/SingletonLock"
         lock.symlink_to("puesto-1234")
         prefs = self.home / ".config/google-chrome/Default/Preferences"
         prefs.write_text("{}")
-        self.run_cli("--clean")
-        self.assertTrue(all((self.home / r / "cached").exists() for r in targets))
-        with (self.home / targets[0] / "cached").open("rb") as handle:
-            self.run_cli("--fclean")
-            self.assertTrue(all(not (self.home / r / "cached").exists() for r in targets))
-            self.assertEqual(handle.read(), b"datos")
+        for mode in ("--clean", "--fclean"):
+            with self.subTest(mode=mode):
+                files = [self.put(f"{relative}/cached") for relative in targets]
+                if mode == "--clean":
+                    preview = self.run_cli("--dry-run").stdout
+                    self.assertTrue(all(str(path.parent) in preview for path in files))
+                    self.assertTrue(all(path.is_file() for path in files))
+                with files[0].open("rb") as handle:
+                    self.run_cli(mode)
+                    self.assertTrue(all(not path.exists() for path in files))
+                    self.assertEqual(handle.read(), b"datos")
         self.assertTrue(lock.is_symlink())
         self.assertEqual(prefs.read_text(), "{}")
 
-    def test_flatpak_busy_application_and_failed_process_listing(self):
+    def test_clean_does_not_require_a_flatpak_process_listing(self):
         flatpak = self.put(".var/app/com.slack.Slack/config/Slack/GPUCache/datos")
         native = self.put(".config/Slack/GPUCache/datos")
         idle = self.put(".config/discord/GPUCache/datos")
-        self.stub("flatpak", "echo com.slack.Slack")
+        self.stub("flatpak", 'touch "$HOME/flatpak-consultado"\nexit 1')
         self.run_cli("--clean")
-        self.assertTrue(flatpak.is_file())
-        self.assertTrue(native.is_file())
-        self.assertFalse(idle.exists())
-        self.stub("flatpak", "exit 1")
-        result = self.run_cli("--clean")
-        self.assertIn("no se pudieron consultar las aplicaciones abiertas", result.stderr)
-        self.assertTrue(flatpak.is_file())
         self.assertFalse(native.exists())
-        self.run_cli("--fclean")
         self.assertFalse(flatpak.exists())
+        self.assertFalse(idle.exists())
+        self.assertFalse((self.home / "flatpak-consultado").exists())
 
     def test_default_help_preview_and_invalid_options(self):
         cached = self.put(".cache/visible")
@@ -205,14 +360,14 @@ class CleanLocationsTests(unittest.TestCase):
 
     def test_clean_selected_files_and_preserves_unrelated_link_targets(self):
         targets = [self.put(relative) for relative in (
-            ".cache/visible/.oculto", ".local/share/Trash/files/descartado", ".npm/_cacache/paquete",
+            ".cache/.oculto", ".cache/visible/.oculto", ".local/share/Trash/files/descartado", ".npm/_cacache/paquete",
             ".bun/install/cache/paquete", ".var/app/ejemplo/cache/visible",
             ".var/app/com.google.Chrome/config/google-chrome/Default/File System/datos",
             ".config/BraveSoftware/Brave-Browser/Profile 12/GPUCache/datos",
             ".config/VSCodium/Code Cache/datos",
         )]
         preserved = [self.put(relative) for relative in (
-            ".cache/.oculto", ".cache/visible/.nfs123", ".config/VSCodium/User/settings.json", "mis-datos",
+            ".cache/visible/.nfs123", ".config/VSCodium/User/settings.json", "mis-datos",
         )]
         inner_link = self.home / ".cache/enlace"
         inner_link.symlink_to(preserved[-1])
@@ -226,6 +381,22 @@ class CleanLocationsTests(unittest.TestCase):
         self.assertFalse(inner_link.is_symlink())
         self.assertTrue(linked_cache.is_symlink())
         self.assertTrue(sentinel.is_file())
+
+    def test_clean_preserves_venvs_in_the_general_cache(self):
+        personal = self.mount_sgoinfre()
+        local = self.home / ".cache/.entorno"
+        moved = personal / ".cache/.entorno"
+        for venv in (local, moved):
+            venv.parent.mkdir()
+            self.run_command(sys.executable, "-I", "-m", "venv", "--without-pip", venv)
+            (venv.parent / ".temporal").touch()
+        self.run_cli("--clean")
+        for venv in (local, moved):
+            self.assertTrue((venv / "pyvenv.cfg").is_file())
+            self.assertFalse((venv.parent / ".temporal").exists())
+        self.run_cli("--fclean")
+        self.assertFalse(local.exists())
+        self.assertFalse(moved.exists())
 
     def test_cache_migration_copies_links_and_can_be_repeated(self):
         personal = self.mount_sgoinfre()
@@ -382,8 +553,6 @@ class CleanLocationsTests(unittest.TestCase):
                         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
                         self.assertIn("está en uso", result.stderr)
                 self.run_cli("--clean")
-                self.assertTrue(cached.is_file())
-                self.run_cli("--fclean")
                 self.assertFalse(cached.exists())
             finally:
                 process.terminate()
@@ -426,6 +595,7 @@ class CleanLocationsTests(unittest.TestCase):
 
     def test_broken_managed_links_and_persistent_data(self):
         personal = self.mount_sgoinfre()
+        self.stub("pgrep", "exit 0")
         disposable = (".cache", ".vscode/extensions", "vscode_config/Cache")
         sources = (".cache", ".vscode/extensions", ".config/Code/Cache", ".local/share")
         logical_sgo = self.home / "sgoinfre" / self.user

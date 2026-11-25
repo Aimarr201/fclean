@@ -1,16 +1,7 @@
 # fclean
 
-`fclean` ayuda a liberar espacio en los 5 GB de `$HOME` de los equipos Ubuntu del campus 42. Puede limpiar cachés al iniciar sesión y trasladar las extensiones de VS Code o la caché general a `$HOME/sgoinfre/$USER`. Cada migración se activa por separado.
+`fclean` ayuda a liberar espacio de `$HOME` de los equipos Ubuntu del campus 42. Puede limpiar cachés al iniciar sesión y trasladar las extensiones de VS Code o la caché general a `sgoinfre`. Cada migración se activa por separado.
 
-## Primer uso en el campus
-
-En Ubuntu, abre una terminal en la carpeta que contiene el script. Con tu cuenta del campus y sin `sudo`, ejecuta la vista previa.
-
-```bash
-bash fclean --dry-run
-```
-
-La vista previa corresponde a `--clean` e indica por separado las migraciones opcionales. Los tamaños son estimaciones. Si una carpeta ya está en `sgoinfre`, vaciarla libera espacio allí. Mover una carpeta fuera del home libera cuota en el home aunque se conserve su contenido.
 
 Si quieres trasladar datos, cierra primero las aplicaciones que los usan **en todos los equipos donde tengas abierta la misma cuenta**. Puedes ejecutar cualquiera de estas migraciones por separado o hacer ambas.
 
@@ -27,6 +18,12 @@ bash fclean --install
 
 La primera limpieza automática ocurre en el siguiente inicio de sesión gráfica. Si quieres limpiar ahora, ejecuta `bash fclean --clean`. **Ambas formas vacían la papelera sin confirmación.**
 
+Para comprobar que borro la ejecucion de inicio puedes usar el comando
+
+```bash
+journalctl --user -b -t 42-fclean.desktop --no-pager
+```
+
 Después de instalar, abre una nueva terminal Zsh para usar `fclean` desde cualquier carpeta. `fclean` muestra la ayuda, `fclean --dry-run` muestra la vista previa y `fclean --clean` ejecuta la limpieza. Puedes cargar el alias en una sesión Zsh que ya esté abierta con `source "${ZDOTDIR:-$HOME}/.zshrc"`.
 
 ## Opciones
@@ -36,8 +33,8 @@ El script acepta una opción por ejecución.
 | Opción | Qué hace |
 | --- | --- |
 | `--dry-run` | Muestra qué limpiaría y qué podría migrarse. Es una operación de solo lectura. |
-| `--clean` | Vacía las rutas seleccionadas y limpia los entornos Python de proyectos que cumplen la regla de cinco días. |
-| `--fclean` | Limpia las cachés conocidas aunque las aplicaciones estén abiertas y conserva las extensiones instaladas de VS Code. Borra los venvs reconocidos en el home sin esperar cinco días. Se ejecuta manualmente. |
+| `--clean` | Limpia las cachés, la papelera y las extensiones obsoletas aunque haya aplicaciones abiertas. Aplica la regla de cinco días a los venvs elegibles. |
+| `--fclean` | Aplica la misma limpieza y borra los venvs reconocidos en el home sin esperar cinco días. Se ejecuta manualmente. |
 | `--migrate-cache` | Copia y verifica `~/.cache` antes de sustituirla por un enlace a `$HOME/sgoinfre/$USER/.cache`. Si ambas carpetas existen, usa `rsync` para combinarlas y se detiene si encuentra un conflicto. |
 | `--migrate` | Copia y verifica `~/.vscode/extensions` y deja un enlace a `$HOME/sgoinfre/$USER/.vscode/extensions`. Si las extensiones de origen y destino difieren, conserva ambas carpetas. |
 | `--install` | Instala o actualiza la copia del script, registra `--clean` en el inicio de sesión gráfica y añade el alias `fclean` y las rutas de sgoinfre al archivo `.zshrc`. |
@@ -46,9 +43,9 @@ El script acepta una opción por ejecución.
 
 ## Qué se borra en cada limpieza
 
-**La caché general se limpia antes y después de migrarla.** Tanto `--clean` como `--dry-run` comprueban `~/.cache` y `$HOME/sgoinfre/$USER/.cache` si el montaje es válido. Si son dos directorios distintos, procesan ambos. Si el home tiene un enlace a la caché migrada, la procesan una sola vez. Esto también funciona sin los exports de Zsh.
+**Ambas limpiezas incluyen las entradas ocultas de la caché general.** `--clean`, `--fclean` y `--dry-run` comprueban `~/.cache` y `$HOME/sgoinfre/$USER/.cache` si el montaje es válido. Si son dos directorios distintos, procesan ambos. Si el home tiene un enlace a la caché migrada, la procesan una sola vez. Esto también funciona sin los exports de Zsh.
 
-Estas rutas se limpian incluso si la aplicación está abierta o existe un `SingletonLock`. La regla equivale a seleccionar `carpeta/*` en Bash. Conserva la carpeta y las entradas ocultas de su primer nivel. Dentro de cada directorio visible seleccionado también elimina los archivos ocultos.
+Las rutas de ambas tablas se limpian incluso con aplicaciones abiertas o un `SingletonLock`. Para las rutas de esta primera tabla, salvo la caché general, se seleccionan las entradas visibles del primer nivel y todo lo que contienen.
 
 | Ubicación | Rutas seleccionadas |
 | --- | --- |
@@ -60,14 +57,14 @@ Estas rutas se limpian incluso si la aplicación está abierta o existe un `Sing
 
 **Todo proyecto o entorno virtual enviado a la papelera se pierde al vaciarla.** La misma regla alcanza los modelos, los tokens de Hugging Face y cualquier otro archivo guardado dentro de un directorio visible de caché. `File System` y `CacheStorage` pueden contener trabajo local de una web y datos para usarla sin conexión.
 
-Para estas ubicaciones adicionales, `--clean` comprueba qué aplicaciones y perfiles están en uso. `--fclean` limpia las mismas rutas incluso con procesos activos, perfiles con `SingletonLock` o aplicaciones Flatpak abiertas.
-
 | Aplicación | Cachés adicionales |
 | --- | --- |
 | Chrome, Chromium y Brave | `component_crx_cache`, `extensions_crx_cache` y, en `Default` y cada `Profile N` numérico, `Cache`, `Code Cache`, `GPUCache`, `File System`, `Service Worker/ScriptCache` y `Service Worker/CacheStorage`. |
 | Firefox y Chromium en Snap | `~/snap/firefox/common/.cache` y `~/snap/chromium/common/.cache`. |
 | Slack y Discord | `Cache`, `Code Cache`, `GPUCache` y las carpetas `ScriptCache` y `CacheStorage` de los service workers. |
-| VS Code y VSCodium | `Cache`, `Code Cache`, `GPUCache`, `CachedData` y los instaladores de `CachedExtensionVSIXs`. En las extensiones migradas, y también en las locales con `--fclean`, solo se buscan archivos de caché antiguos con el formato de descarte de Chromium. |
+| VS Code y VSCodium | `Cache`, `Code Cache`, `GPUCache`, `CachedData` y los instaladores de `CachedExtensionVSIXs`. En las extensiones locales y migradas, la limpieza de caché se limita a los archivos de descarte de Chromium. |
+
+Ambos modos retiran las versiones de extensiones marcadas en `.obsolete` que ya no figuran en el registro de extensiones ni en los perfiles comprobados.
 
 El recorrido se limita a rutas validadas del usuario. Omite entradas de otros propietarios, archivos temporales `.nfs*`, montajes anidados y destinos de enlaces simbólicos ajenos a las migraciones reconocidas. La vista previa aplica las mismas reglas que la limpieza. Una aplicación abierta puede volver a crear archivos mientras se limpia su caché.
 
@@ -75,15 +72,13 @@ El recorrido se limita a rutas validadas del usuario. Omite entradas de otros pr
 
 `bash fclean --fclean` borra sin confirmación los **venvs reconocidos en el home**, incluso si están activos, son recientes, contienen `.fclean-keep` o carecen de un proyecto asociado. También busca entornos en las carpetas de herramientas como Poetry y pipx. Un directorio que mezcla el entorno y archivos de proyecto en su raíz queda fuera de esta regla.
 
-Vacía la caché general, incluidas sus entradas ocultas, tanto en `~/.cache` como en `$HOME/sgoinfre/$USER/.cache`, donde existan. Conserva las extensiones instaladas de VS Code, sus índices y los entornos Python que distribuyen, tanto en el home como en `sgoinfre`.
-
 En Linux se puede borrar la entrada de un archivo que una aplicación tiene abierto. El espacio que ocupa puede seguir en uso hasta que se cierre el último descriptor. En un home NFS pueden quedar temporalmente archivos `.nfs*`; el script los omite. La aplicación también puede volver a crear su caché durante la misma sesión. [Manual de Linux sobre unlink](https://man7.org/linux/man-pages/man2/unlink.2.html)
 
 El inicio de sesión instalado con `--install` sigue ejecutando `--clean`.
 
 ## Entornos Python y plazo de cinco días
 
-`--clean` busca en el home entornos Python 3 que pertenezcan al usuario. Reconoce un `pyvenv.cfg` con la clave `home`, un `bin/python` ejecutable y el directorio `lib/python3.X/site-packages`. El nombre del entorno es libre. Si su raíz contiene archivos de proyecto mezclados con el entorno, la conserva. Las cachés también respetan los directorios con `pyvenv.cfg`. La papelera mantiene su regla de vaciado explícito. [Estructura de un venv según Python](https://docs.python.org/3/library/venv.html)
+`--clean` busca en el home entornos Python 3 que pertenezcan al usuario. Reconoce un `pyvenv.cfg` con la clave `home`, un `bin/python` ejecutable y el directorio `lib/python3.X/site-packages`. El nombre del entorno es libre. Si su raíz contiene archivos de proyecto mezclados con el entorno, la conserva. Al vaciar cachés, `--clean` omite los directorios con `pyvenv.cfg`. La papelera mantiene su regla de vaciado explícito. [Estructura de un venv según Python](https://docs.python.org/3/library/venv.html)
 
 1. **Asociación al proyecto.** Busca un repositorio Git entre los directorios superiores, un manifiesto de Python o archivos `.py` junto al directorio del venv. Un entorno centralizado, como `~/Python_envs/Py09_env`, se conserva si no puede asociarse a un proyecto. El recorrido excluye `sgoinfre`, otros montajes, cachés y las instalaciones propias de herramientas como Poetry y pipx.
 2. **Primer encuentro.** `--clean` coloca `fclean_venv_usage_v1.pth` y `_fclean_venv_usage_v1.py` en el `site-packages` del entorno. El plazo empieza en ese momento, incluso para un venv creado hace meses. `--dry-run` muestra qué entornos empezarían el seguimiento y cuáles se borrarían, sin instalar archivos.
@@ -114,6 +109,10 @@ Las limpiezas posteriores vacían también la caché trasladada o configurada po
 
 ## Actualizar o desactivar
 
-Cuando cambies de versión, vuelve a ejecutar `bash fclean --install` desde la copia nueva. Por defecto, la copia instalada está en `~/.config/fclean/fclean` y la entrada de inicio en `~/.config/autostart/42-fclean.desktop`. Si has definido `XDG_CONFIG_HOME`, ambas rutas parten de ese directorio. El instalador usa `~/.zshrc` por defecto. Si exportas `ZDOTDIR`, indica una ruta absoluta para que use `$ZDOTDIR/.zshrc`. Al modificar un archivo existente, guarda una copia junto a él.
+Cada `--clean`, incluido el del inicio de sesión, comprueba con `curl` si ha cambiado el script de la rama `main` de `Aimarr201/fclean`. Si hay una versión nueva válida, la guarda y ejecuta la limpieza con ella. Si el servidor no responde o la descarga no es válida, usa la copia disponible. La comprobación tiene un límite de seis segundos y usa el ETag para ahorrar descargas.
+
+El alias y el inicio automático usan la copia de `${XDG_CONFIG_HOME:-$HOME/.config}/fclean/fclean`. Para habilitar las actualizaciones en una instalación anterior, ejecuta `bash fclean --install` una vez desde una copia con esta función. Una ejecución directa fuera de la instalación usa una copia en el directorio temporal de la sesión y conserva el archivo original. Si el script del repositorio tiene cambios locales, `--clean` ejecuta esa versión para que puedas probarla.
+
+La entrada de inicio está en `autostart/42-fclean.desktop` dentro de la misma base de configuración. El instalador usa `~/.zshrc` por defecto. Si exportas `ZDOTDIR`, indica una ruta absoluta para que use `$ZDOTDIR/.zshrc`. Al modificar un archivo existente, guarda una copia junto a él.
 
 Para desactivar la limpieza automática y retirar el alias y los exports de Zsh, ejecuta `bash fclean --uninstall` con el mismo `ZDOTDIR` que usaste al instalar.
