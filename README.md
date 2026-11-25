@@ -87,7 +87,7 @@ El inicio de sesión instalado con `--install` sigue ejecutando `--clean`.
 
 **Para proteger el venv de un proyecto frente a `--clean`**, crea `.fclean-keep` en la raíz del proyecto o del propio entorno. Es especialmente útil con `python -S`, que omite el seguimiento de arranque. También cubre sesiones de otro puesto que ya estaban abiertas antes de instalar el seguimiento, ediciones sin guardar y accesos desde un montaje de solo lectura. En NFS, algunas lecturas servidas desde caché tampoco actualizan la fecha que ve el servidor. [Arranque de Python](https://docs.python.org/3/library/site.html) · [Fechas de acceso en NFS](https://man7.org/linux/man-pages/man5/nfs.5.html)
 
-En Ubuntu puedes comprobar ambas opciones con `python3 -m unittest discover -s tests` desde el repositorio. Las pruebas usan un home temporal, simulan el paso de los días y comprueban qué se borra con las carpetas de migración separadas o enlazadas.
+En Ubuntu puedes comprobar ambas opciones desde la rama `dev` con `python3 -m unittest discover -s tests`. Las pruebas usan un home temporal, simulan el paso de los días y comprueban qué se borra con las carpetas de migración separadas o enlazadas.
 
 ## Cómo se usa sgoinfre
 
