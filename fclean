@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # fclean para las sesiones de usuario de Ubuntu del campus 42.
+# fclean: actualizaciones v1
 set -euo pipefail
 umask 077
 shopt -s nullglob
@@ -9,8 +10,8 @@ usage() {
 Uso: fclean [opción] o bash fclean [opción]
 
   --dry-run        Muestra qué se limpiaría y qué puede migrarse.
-  --clean          Vacía cachés y papelera. Borra venvs tras 5 días de inactividad.
-  --fclean         Fuerza la limpieza y borra venvs reconocidos, incluso activos.
+  --clean          Comprueba actualizaciones y limpia. Venvs tras 5 días de inactividad.
+  --fclean         Misma limpieza con borrado inmediato de venvs reconocidos.
   --migrate        Traslada las extensiones de VS Code a sgoinfre.
   --migrate-cache  Traslada ~/.cache a sgoinfre.
   --install        Configura el alias en Zsh y la limpieza al iniciar sesión.
@@ -53,11 +54,102 @@ env_begin='# >>> fclean: entorno sgoinfre >>>'
 env_end='# <<< fclean: entorno sgoinfre <<<'
 
 # El bloqueo local también funciona cuando la cuota del home está agotada.
+resumed_clean=false
 if [[ $mode != --dry-run && $mode != --prepare-env ]]; then
     runtime=${XDG_RUNTIME_DIR:-/run/user/$UID}
     [[ -d $runtime && -O $runtime && ! -L $runtime ]] || die 'No se encuentra el directorio de ejecución de la sesión.'
-    exec 9>>"$runtime/42-fclean.lock"
+    lock="$runtime/42-fclean.lock"
+    if [[ $mode == --clean && ${FCLEAN_UPDATED_PID:-} == "$$" && /proc/self/fd/9 -ef "$lock" ]]; then
+        resumed_clean=true
+    else
+        exec 9>>"$lock"
+    fi
     flock -n 9 || die 'Ya hay otra ejecución de fclean o no se pudo tomar el bloqueo.'
+fi
+unset FCLEAN_UPDATED_PID
+
+clean_update_target() {
+    local source=$1 dir=${1%/*} checksum target initial
+    if [[ $source -ef $installed && ! -L $installed && -O $installed ]]; then
+        printf '%s\n' "$installed"
+        return
+    fi
+    # Conserva el script original al ejecutar desde una copia de trabajo.
+    if command -v git >/dev/null && git -C "$dir" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+        if ! git -C "$dir" ls-files --error-unmatch -- "${source##*/}" >/dev/null 2>&1 ||
+           ! git -C "$dir" diff --quiet --no-ext-diff HEAD -- "${source##*/}"; then
+            return 1
+        fi
+    fi
+    checksum=$(sha256sum < "$source") || return 1
+    target="$runtime/fclean-${checksum%% *}"
+    if ! present "$target"; then
+        initial=$(mktemp -- "$runtime/.fclean-initial.XXXXXXXX") || return 1
+        if ! cp -- "$source" "$initial" || ! mv -T -- "$initial" "$target"; then
+            rm -f -- "$initial"
+            return 1
+        fi
+    fi
+    printf '%s\n' "$target"
+}
+
+valid_update() {
+    [[ -f $1 && -O $1 && ! -L $1 ]] &&
+        grep -Fxq -- '# fclean para las sesiones de usuario de Ubuntu del campus 42.' "$1" &&
+        grep -Fxq -- '# fclean: actualizaciones v1' "$1" &&
+        BASH_ENV= /bin/bash -n -- "$1"
+}
+
+update_clean_copy() (
+    local target=$1 lock_file=$1.update.lock state=$1.etag stage response digest saved_digest etag lock_fd changed=false
+    local upstream='https://raw.githubusercontent.com/Aimarr201/fclean/main/fclean'
+    local -a conditional=()
+    # 0 indica una copia nueva, 1 indica que puede usarse la copia actual.
+    [[ -f $target && -O $target && ! -L $target ]] || exit 2
+    if present "$lock_file" && [[ ! -f $lock_file || ! -O $lock_file || -L $lock_file ]]; then exit 2; fi
+    exec {lock_fd}>>"$lock_file" || exit 2
+    flock -n "$lock_fd" || exit 1
+    stage=$(mktemp -d -- "${target%/*}/.fclean-update.XXXXXXXX") || exit 2
+    trap 'rm -f -- "$stage/script" "$stage/request" "$stage/etag" "$stage/state"; rmdir -- "$stage"' EXIT
+    digest=$(sha256sum < "$target") || exit 2
+    if [[ -f $state && -O $state && ! -L $state ]] &&
+       { IFS= read -r saved_digest && IFS= read -r etag; } < "$state" &&
+       [[ ${digest%% *} == "$saved_digest" && -n $etag ]]; then
+        printf '%s\n' "$etag" > "$stage/request" || exit 2
+        conditional=(--etag-compare "$stage/request")
+    fi
+    response=$(curl -q --silent --show-error --fail --proto '=https' --connect-timeout 3 --max-time 6 \
+        "${conditional[@]}" --etag-save "$stage/etag" --output "$stage/script" \
+        --write-out '%{http_code}' "$upstream") || exit 2
+    [[ $response != 304 ]] || exit 1
+    [[ $response == 200 ]] && valid_update "$stage/script" || exit 2
+    if ! cmp -s -- "$target" "$stage/script"; then
+        chmod --reference="$target" -- "$stage/script" && mv -T -- "$stage/script" "$target" || exit 2
+        changed=true
+    fi
+    if [[ -s $stage/etag ]] && IFS= read -r etag < "$stage/etag" && [[ -n $etag ]] &&
+       digest=$(sha256sum < "$target") && printf '%s\n%s\n' "${digest%% *}" "$etag" > "$stage/state"; then
+        mv -T -- "$stage/state" "$state" || notice 'No se pudo guardar el ETag de fclean.'
+    fi
+    $changed
+)
+
+if [[ $mode == --clean ]] && ! $resumed_clean; then
+    if ! command -v curl >/dev/null; then
+        notice 'curl no está disponible. Se continúa la limpieza con la copia actual.'
+    elif source_script=$(realpath -e -- "${BASH_SOURCE[0]}") && update_target=$(clean_update_target "$source_script"); then
+        updated=false
+        if update_clean_copy "$update_target"; then
+            updated=true
+            notice 'fclean actualizado desde main.'
+        elif [[ $? == 2 ]]; then
+            notice 'No se pudo actualizar fclean. Se continúa con la copia disponible.'
+        fi
+        if $updated || { [[ $update_target != "$source_script" ]] &&
+                         ! cmp -s -- "$source_script" "$update_target" && valid_update "$update_target"; }; then
+            FCLEAN_UPDATED_PID="$$" exec /bin/bash -- "$update_target" --clean
+        fi
+    fi
 fi
 
 has_legacy_block() {
@@ -562,6 +654,7 @@ if [[ $mode == --uninstall ]]; then inspect_home_venvs; exit 0; fi
 clean_contents() {
     python3 -IS - "$mode" "$@" <<'PY'
 import errno
+import json
 import os
 import stat
 import sys
@@ -570,7 +663,9 @@ apply = sys.argv[1] in ("--clean", "--fclean")
 root = sys.argv[2]
 # La regla carpeta/* selecciona entradas visibles en la raíz y todo lo que contienen.
 visible_children = sys.argv[3] == "*"
-full_tree = sys.argv[3] == "all"
+obsolete_extensions = sys.argv[3] == "obsolete"
+full_tree = sys.argv[3] == "all" or obsolete_extensions
+remove_cached_venvs = full_tree and sys.argv[1] == "--fclean"
 guarded = not (visible_children or full_tree)
 in_trash = sys.argv[4] == "trash"
 keep = {"huggingface/token", "huggingface/stored_tokens"}
@@ -584,15 +679,19 @@ def mount_id(fd):
     with open(f"/proc/self/fdinfo/{fd}", encoding="ascii") as info:
         return next(line for line in info if line.startswith("mnt_id:"))
 
-def clean(fd, relative, mount):
+def clean(fd, relative, mount, apply):
     global files, blocks, directories
+    if obsolete_extensions and not os.access(".", os.W_OK | os.X_OK, dir_fd=fd):
+        return False
     names = os.listdir(fd)
-    if "pyvenv.cfg" in names and not (in_trash or full_tree):
+    if "pyvenv.cfg" in names and not (in_trash or obsolete_extensions or remove_cached_venvs):
         return False
     if guarded and (markers.intersection(names) or {"HEAD", "objects", "refs"}.issubset(names)):
         return False
     empty = True
     for name in names:
+        if obsolete_extensions and apply and not relative and name == "package.json":
+            continue  # Conserva el manifiesto si el recorrido se interrumpe.
         path = os.path.join(relative, name)
         if (name.startswith(".nfs") or (visible_children and not relative and name.startswith("."))
                 or (guarded and (path in keep or name in {".venv", "venv"}))):
@@ -606,7 +705,7 @@ def clean(fd, relative, mount):
                 child = os.open(name, flags, dir_fd=fd)
                 try:
                     removable = (os.path.samestat(entry, os.fstat(child))
-                                 and mount_id(child) == mount and clean(child, path, mount))
+                                 and mount_id(child) == mount and clean(child, path, mount, apply))
                     if removable and apply:
                         current = os.stat(name, dir_fd=fd, follow_symlinks=False)
                         if os.path.samestat(entry, current):
@@ -620,7 +719,7 @@ def clean(fd, relative, mount):
                     blocks += entry.st_blocks
                 else:
                     empty = False
-            elif not guarded or stat.S_ISREG(entry.st_mode) or stat.S_ISLNK(entry.st_mode):
+            elif (not guarded and not obsolete_extensions) or stat.S_ISREG(entry.st_mode) or stat.S_ISLNK(entry.st_mode):
                 if apply:
                     os.unlink(name, dir_fd=fd)
                 files += 1
@@ -643,15 +742,123 @@ def clean(fd, relative, mount):
                 print(f"Se omite {os.path.join(root, path)!r}: {exc.strerror}", file=sys.stderr)
     return empty
 
+def read_extension_json(path, dir_fd=None):
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dir_fd)
+    with os.fdopen(fd, encoding="utf-8") as stream:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != uid:
+            raise ValueError(f"registro de extensiones inesperado: {path!r}")
+        return json.load(stream)
+
+def installed_extensions(fd, editor_roots):
+    registries = [("extensions.json", fd)]
+    for editor_root in set(editor_roots):
+        profiles = os.path.join(editor_root, "User", "profiles")
+        try:
+            with os.scandir(profiles) as entries:
+                registries.extend((os.path.join(entry.path, "extensions.json"), None)
+                                  for entry in entries if entry.is_dir())
+        except FileNotFoundError:
+            continue
+    locations, versions = set(), set()
+    for path, parent_fd in registries:
+        try:
+            entries = read_extension_json(path, parent_fd)
+        except FileNotFoundError:
+            continue
+        if not isinstance(entries, list) or any(not isinstance(entry, dict) for entry in entries):
+            raise ValueError(f"registro de extensiones inválido: {path!r}")
+        for entry in entries:
+            location = entry.get("location")
+            paths = (entry.get("relativeLocation"), location.get("path") if isinstance(location, dict) else None)
+            names = {os.path.basename(value.rstrip("/")).casefold() for value in paths if isinstance(value, str) and value}
+            if names:
+                locations.update(names)
+                continue
+            identifier = entry.get("identifier")
+            name = identifier.get("id") if isinstance(identifier, dict) else None
+            version = entry.get("version")
+            if not isinstance(name, str) or not isinstance(version, str):
+                raise ValueError(f"extensión sin ubicación o versión en {path!r}")
+            versions.add((name.casefold(), version))
+    return locations, versions
+
+def extension_manifest(fd):
+    manifest = read_extension_json("package.json", fd)
+    if not isinstance(manifest, dict):
+        raise ValueError("package.json inválido")
+    publisher, name, version = (manifest.get(field) for field in ("publisher", "name", "version"))
+    if not all(isinstance(field, str) and field for field in (publisher, name, version)):
+        raise ValueError("package.json sin editor, nombre o versión")
+    identifier = f"{publisher}.{name}".casefold()
+    metadata = manifest.get("__metadata")
+    platform = metadata.get("targetPlatform") if isinstance(metadata, dict) else None
+    suffix = f"-{platform}" if platform and platform != "undefined" else ""
+    return f"{identifier}-{version}{suffix}", (identifier, version)
+
+def clean_obsolete(fd, mount, editor_roots):
+    global files, blocks, directories
+    try:
+        marked = read_extension_json(".obsolete", fd)
+    except FileNotFoundError:
+        return
+    if not isinstance(marked, dict):
+        raise ValueError(".obsolete debe ser un objeto JSON")
+    locations, versions = installed_extensions(fd, editor_roots)
+    for name, remove in marked.items():
+        if (remove is not True or not name or name.startswith(".") or "/" in name or "\0" in name
+                or name.casefold() in locations):
+            continue
+        path = os.path.join(root, name)
+        try:
+            entry = os.stat(name, dir_fd=fd, follow_symlinks=False)
+            if not stat.S_ISDIR(entry.st_mode) or entry.st_uid != uid:
+                continue
+            child = os.open(name, flags, dir_fd=fd)
+            try:
+                if not os.path.samestat(entry, os.fstat(child)) or mount_id(child) != mount:
+                    continue
+                key, version = extension_manifest(child)
+                if key.casefold() != name.casefold() or version in versions:
+                    continue
+                files = blocks = directories = 0
+                remaining_links.clear()
+                if not clean(child, "", mount, False):
+                    continue
+                size = (blocks + entry.st_blocks + 1) // 2
+                if apply:
+                    current = read_extension_json(".obsolete", fd)
+                    locations, versions = installed_extensions(fd, editor_roots)
+                    if (not isinstance(current, dict) or current.get(name) is not True
+                            or name.casefold() in locations or version in versions
+                            or not os.path.samestat(entry, os.stat(name, dir_fd=fd, follow_symlinks=False))):
+                        continue
+                    if not clean(child, "", mount, True):
+                        continue
+                    if not os.path.samestat(entry, os.stat(name, dir_fd=fd, follow_symlinks=False)):
+                        continue
+                    os.unlink("package.json", dir_fd=child)
+                    os.rmdir(name, dir_fd=fd)
+                print(f"{size}\t{path!r} (extensión marcada en .obsolete)")
+            finally:
+                os.close(child)
+        except FileNotFoundError:
+            continue
+        except (OSError, ValueError) as exc:
+            print(f"Se omite {path!r}: {exc}", file=sys.stderr)
+
 fd = os.open(".", flags)
 try:
     if os.fstat(fd).st_uid == uid:
-        clean(fd, "", mount_id(fd))
-except OSError as exc:
-    print(f"Se omite {root!r}: {exc.strerror}", file=sys.stderr)
+        if obsolete_extensions:
+            clean_obsolete(fd, mount_id(fd), sys.argv[5:])
+        else:
+            clean(fd, "", mount_id(fd), apply)
+except (OSError, ValueError) as exc:
+    print(f"Se omite {root!r}: {exc}", file=sys.stderr)
 finally:
     os.close(fd)
-if files or directories:
+if not obsolete_extensions and (files or directories):
     print(f"{(blocks + 1) // 2}\t{root!r} ({files} archivos y enlaces, {directories} directorios)")
 PY
 }
@@ -686,6 +893,11 @@ clean_directory() (
     if [[ $root == "$sgo_root" ]]; then
         [[ $(stat -Lc '%d:%i' -- "$root") == "$sgo_identity" &&
            $(stat -c %d -- .) == "${sgo_identity%:*}" ]] || return 0
+    fi
+    if [[ $pattern == obsolete ]]; then
+        shift 2
+        clean_contents "$dir" "$pattern" extensions "$@"
+        return
     fi
     if [[ -z $pattern || $pattern == '*' || $pattern == all ]]; then
         if [[ $1 == "$home/.local/share/Trash" ]]; then
@@ -722,12 +934,12 @@ clean_named_caches() {
 
 # Las dos copias pueden coexistir antes de migrar o después de quitar un enlace.
 clean_general_cache() {
-    local src="$home/.cache" dst="$sgo/.cache" pattern=$1
+    local src="$home/.cache" dst="$sgo/.cache"
     if [[ -n $sgo_root && -d $dst ]] && trusted_destination "$dst"; then
-        clean_directory "$dst" "$pattern"
+        clean_directory "$dst" all
         if [[ $src -ef $dst ]]; then return 0; fi
     fi
-    clean_directory "$src" "$pattern"
+    clean_directory "$src" all
 }
 
 clean_browser_profiles() {
@@ -746,12 +958,7 @@ clean_browser_profiles() {
 clean_extension_caches() {
     local installed_ext="$home/.vscode/extensions" root extension
     local -a roots=()
-    if [[ $mode == --fclean ]]; then
-        if plain_directory "$home" "$installed_ext"; then roots+=("$installed_ext"); fi
-    else
-        [[ -n ${managed_dirs[$installed_ext]:-} || -n ${managed_dirs[$home/.vscode]:-} ]] || return 0
-        [[ $(realpath -e -- "$installed_ext") == "$sgo_root/.vscode/extensions" ]] || return 0
-    fi
+    if plain_directory "$home" "$installed_ext"; then roots+=("$installed_ext"); fi
     if [[ -n $sgo_root ]] && trusted_destination "$sgo/.vscode/extensions" &&
        plain_directory "$sgo_root" "$sgo_root/.vscode/extensions"; then
         roots+=("$sgo/.vscode/extensions")
@@ -766,40 +973,14 @@ clean_extension_caches() {
     done
 }
 
-# La limpieza normal respeta los procesos y bloqueos de perfil.
-clean_gui_caches() {
-    local kind=$1 label=$2 processes=$3 id=$4 base
-    shift 4
-    local -a roots=()
-    for base in "$@"; do
-        if [[ $base == "$home/.var/app/"* && $inspect_flatpaks == false ]]; then continue; fi
-        roots+=("$base")
-        # El perfil puede estar en uso desde otra máquina que comparte el home.
-        if [[ $mode != --fclean ]] && present "$base/SingletonLock"; then
-            notice "Se omiten las cachés adicionales de $label por el bloqueo de perfil en $base"
-            busy_flatpaks[$id]=1
-        fi
-    done
-    if [[ $mode != --fclean ]] && ! app_closed "$processes" "el resto de las cachés de $label"; then busy_flatpaks[$id]=1; fi
-    [[ -z ${busy_flatpaks[$id]:-} ]] || return 0
-    for base in "${roots[@]}"; do
-        case $kind in
-            browser) clean_browser_profiles "$base" ;;
-            electron) clean_named_caches "$base" Cache 'Code Cache' GPUCache \
-                'Service Worker/ScriptCache' 'Service Worker/CacheStorage' ;;
-            editor) clean_named_caches "$base" Cache 'Code Cache' GPUCache CachedData CachedExtensionVSIXs ;;
-        esac
-    done
-}
-
 clean_app_caches() {
-    local dir id running profile
+    local dir profile
     local apps="$home/.var/app"
     local chrome="$apps/com.google.Chrome/config/google-chrome"
     local code="$apps/com.visualstudio.code/config/Code"
     local -A listed_dirs=()
-    local -A busy_flatpaks=()
-    local inspect_flatpaks=true
+    local -a editor_roots=("$home/.config/Code" "$home/.config/Code - Insiders" "$home/.config/Code - OSS" "$code"
+        "$home/.config/VSCodium" "$apps/com.vscodium.codium/config/VSCodium")
     local -a targets=(
         "$home/.local/share/Trash" "$home/.npm/_cacache" "$home/.bun/install/cache"
         "$apps"/*/cache "$chrome/component_crx_cache" "$chrome/extensions_crx_cache"
@@ -809,55 +990,33 @@ clean_app_caches() {
     for profile in "$chrome/Default" "$chrome"/Profile\ [0-9]; do
         targets+=("$profile/File System" "$profile/Service Worker/CacheStorage" "$profile/Service Worker/ScriptCache")
     done
-    if [[ $mode == --fclean ]]; then
-        clean_general_cache all
-    else
-        clean_general_cache '*'
-    fi
+    clean_general_cache
     for dir in "${targets[@]}"; do
         clean_directory "$dir" '*'
         # Las reglas adicionales no deben repetir la ruta ni contarla en la vista previa.
         listed_dirs["$dir"]=1
     done
 
-    # flatpak ps identifica también aplicaciones cuyo proceso tiene otro nombre.
-    if [[ $mode != --fclean ]] && command -v flatpak >/dev/null; then
-        if running=$(flatpak ps --columns=application); then
-            while read -r id; do
-                if [[ -n $id ]]; then busy_flatpaks["$id"]=1; fi
-            done <<< "$running"
-        else
-            inspect_flatpaks=false
-            notice 'Se omiten las cachés adicionales de Flatpak porque no se pudieron consultar las aplicaciones abiertas.'
-        fi
-    fi
-
-    clean_gui_caches browser Chrome 'chrome|google-chrome|chrome-beta|chrome-unstable' com.google.Chrome \
+    clean_browser_profiles \
         "$home/.config"/{google-chrome,google-chrome-beta,google-chrome-unstable} \
-        "$home/.var/app/com.google.Chrome/config/google-chrome"
-    clean_gui_caches browser Chromium 'chromium|chromium-browse' org.chromium.Chromium \
+        "$chrome" \
         "$home/.config/chromium" "$home/snap/chromium/common/chromium" \
-        "$home/.var/app/org.chromium.Chromium/config/chromium"
-    if [[ -z ${busy_flatpaks[org.chromium.Chromium]:-} ]]; then clean_directory "$home/snap/chromium/common/.cache"; fi
-    clean_gui_caches browser Brave 'brave|brave-browser' com.brave.Browser \
-        "$home/.config/BraveSoftware/Brave-Browser" "$home/.var/app/com.brave.Browser/config/BraveSoftware/Brave-Browser"
+        "$apps/org.chromium.Chromium/config/chromium" \
+        "$home/.config/BraveSoftware/Brave-Browser" "$apps/com.brave.Browser/config/BraveSoftware/Brave-Browser"
+    clean_directory "$home/snap/chromium/common/.cache"
+    clean_directory "$home/snap/firefox/common/.cache"
 
-    if [[ $mode == --fclean ]] || { app_closed 'firefox|firefox-bin' 'la caché Snap de Firefox' &&
-                                     [[ -z ${busy_flatpaks[org.mozilla.firefox]:-} ]]; }; then
-        clean_directory "$home/snap/firefox/common/.cache"
-    fi
-
-    clean_gui_caches electron Discord discord com.discordapp.Discord \
-        "$home/.config/discord" "$home/.var/app/com.discordapp.Discord/config/discord"
-    clean_gui_caches electron Slack slack com.slack.Slack \
-        "$home/.config/Slack" "$home/.var/app/com.slack.Slack/config/Slack"
-    clean_gui_caches editor 'VS Code' "$code_processes" com.visualstudio.code \
-        "$home/.config/Code" "$home/.config/Code - Insiders" "$home/.config/Code - OSS" \
-        "$home/.var/app/com.visualstudio.code/config/Code"
-    clean_gui_caches editor VSCodium "$code_processes" com.vscodium.codium \
-        "$home/.config/VSCodium" "$home/.var/app/com.vscodium.codium/config/VSCodium"
-    if [[ -z ${busy_flatpaks[com.visualstudio.code]:-} && -z ${busy_flatpaks[com.vscodium.codium]:-} ]]; then
-        clean_extension_caches
+    for dir in "$home/.config/discord" "$apps/com.discordapp.Discord/config/discord" \
+               "$home/.config/Slack" "$apps/com.slack.Slack/config/Slack"; do
+        clean_named_caches "$dir" Cache 'Code Cache' GPUCache 'Service Worker/ScriptCache' 'Service Worker/CacheStorage'
+    done
+    for dir in "${editor_roots[@]}"; do
+        clean_named_caches "$dir" Cache 'Code Cache' GPUCache CachedData CachedExtensionVSIXs
+    done
+    clean_extension_caches
+    if present "$home/.vscode/extensions/.obsolete"; then
+        clean_directory "$home/.vscode/extensions" obsolete "${editor_roots[@]}" \
+            "$config/Code" "$config/Code - Insiders" "$config/Code - OSS" "$config/VSCodium"
     fi
 }
 
@@ -1228,18 +1387,21 @@ if ! sgo_available; then
     notice "No se pudo verificar $sgo como almacenamiento separado y escribible."
     [[ $mode != --migrate ]] || exit 1
 else
-    if [[ $mode != --migrate ]]; then repair_disposable_links; fi
-    if app_closed "$code_processes" 'la gestión de enlaces de VS Code'; then
-        repair_link "$home/.vscode" "$sgo/.vscode"
-        repair_link "$home/.vscode/extensions" "$sgo/.vscode/extensions"
-        case $mode in
-            --migrate) migrate_directory .vscode/extensions ;;
-            --dry-run) preview_migration .vscode/extensions ;;
-        esac
-    elif [[ $mode == --migrate ]]; then
-        exit 1
+    if [[ $mode == --migrate ]]; then
+        app_closed "$code_processes" 'la migración de extensiones de VS Code' || exit 1
+    else
+        repair_disposable_links
     fi
-    if [[ $mode == --dry-run ]]; then preview_migration .cache; fi
+    repair_link "$home/.vscode" "$sgo/.vscode"
+    repair_link "$home/.vscode/extensions" "$sgo/.vscode/extensions"
+    case $mode in
+        --migrate) migrate_directory .vscode/extensions ;;
+        --dry-run)
+            if app_closed "$code_processes" 'la migración de extensiones de VS Code'; then
+                preview_migration .vscode/extensions
+            fi
+            preview_migration .cache ;;
+    esac
 fi
 if [[ $mode == --clean || $mode == --fclean ]]; then
     print_clean_summary "$total_cleaned_kib"
