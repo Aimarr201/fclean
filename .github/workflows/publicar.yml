@@ -1,0 +1,72 @@
+name: Publicar fclean
+
+on:
+  push:
+    tags:
+      - 'publicar-*'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publicar-fclean-main
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  pruebas:
+    if: github.event.created
+    runs-on: ubuntu-24.04
+    outputs:
+      revision: ${{ steps.revision.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Comprobar la revisión de la etiqueta
+        id: revision
+        run: |
+          revision=$(git rev-parse HEAD)
+          if ! git merge-base --is-ancestor "$revision" refs/remotes/origin/dev; then
+            printf 'La etiqueta debe apuntar a un commit publicado en dev.\n' >&2
+            exit 1
+          fi
+          printf 'sha=%s\n' "$revision" >> "$GITHUB_OUTPUT"
+
+      - name: Ejecutar las pruebas
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y zsh rsync desktop-file-utils python3-venv
+          bash -n fclean
+          python3 -B -W error -m unittest discover -s tests
+
+  publicar:
+    needs: pruebas
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Publicar los archivos probados
+        env:
+          REVISION: ${{ needs.pruebas.outputs.revision }}
+        run: |
+          git restore --source="$REVISION" --staged --worktree -- fclean README.md
+          if git diff --cached --quiet; then
+            printf 'main ya contiene la versión probada.\n'
+            exit 0
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m "Publicar fclean desde $REVISION"
+          git push origin HEAD:refs/heads/main
