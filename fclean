@@ -14,8 +14,10 @@ Uso: fclean [opción] o bash fclean [opción]
   --fclean         Misma limpieza con borrado inmediato de venvs reconocidos.
   --migrate        Traslada las extensiones de VS Code a sgoinfre.
   --migrate-cache  Traslada ~/.cache a sgoinfre.
+  --alias          Añade solo el alias de Zsh a la copia de ~/.config/fclean.
   --install        Configura el alias en Zsh y la limpieza al iniciar sesión.
-  --uninstall      Retira la configuración y el seguimiento de venvs.
+  --uninstall      Retira el inicio automático y la configuración de sgoinfre; conserva el alias.
+  --funinstall     Retira toda la instalación, incluido el script y el seguimiento de venvs.
   -h, --help       Muestra esta ayuda, también disponible sin opciones.
 
 La limpieza borra datos sin confirmación. Cierra las aplicaciones antes de migrar.
@@ -30,7 +32,7 @@ present() { [[ -e $1 || -L $1 ]]; }
 mode=${1:---help}
 case $mode in
     --help|-h) usage; exit 0 ;;
-    --dry-run|--clean|--fclean|--migrate|--migrate-cache|--install|--uninstall|--prepare-env) ;;
+    --dry-run|--clean|--fclean|--migrate|--migrate-cache|--alias|--install|--uninstall|--funinstall|--prepare-env) ;;
     *) usage >&2; exit 2 ;;
 esac
 
@@ -52,6 +54,8 @@ begin='# >>> 42-SGOINFRE-SHIELD >>>'
 end='# <<< 42-SGOINFRE-SHIELD <<<'
 env_begin='# >>> fclean: entorno sgoinfre >>>'
 env_end='# <<< fclean: entorno sgoinfre <<<'
+alias_begin='# >>> fclean: alias >>>'
+alias_end='# <<< fclean: alias <<<'
 
 # El bloqueo local también funciona cuando la cuota del home está agotada.
 resumed_clean=false
@@ -157,9 +161,21 @@ has_legacy_block() {
     grep -Fxq -e "$begin" -e "$end" -- "$1" || { [[ $? == 1 ]] && return 1; die "No se pudo leer $1"; }
 }
 
+write_zsh_alias() {
+    local command
+    printf -v command '/bin/bash %q' "$1"
+    printf 'alias fclean=%q\n' "$command"
+}
+
 write_zsh_block() {
     local installed_command
     printf -v installed_command '/bin/bash %q' "$installed"
+    if [[ $1 == alias ]]; then
+        printf '%s\n' "$alias_begin"
+        write_zsh_alias "$installed"
+        printf '%s\n' "$alias_end"
+        return
+    fi
     printf '%s\n' "$env_begin"
     printf 'if %s --prepare-env; then\n' "$installed_command"
     cat <<'ZSH'
@@ -177,51 +193,115 @@ else
     if [[ ${SGO:-} == "$HOME/sgoinfre/${USER:-}" ]]; then unset SGO; fi
 fi
 ZSH
-    printf 'alias fclean=%q\n' "$installed_command"
+    write_zsh_alias "$installed"
     printf '%s\n' "$env_end"
 }
 
+rotate_zsh_backups() {
+    local new=$1 keep=$1 latest='' file meta LC_ALL=C
+    shift
+    if [[ -z $new ]] && (( $# < 2 )); then return 0; fi
+    local -a copies=()
+    for file in "$@"; do
+        [[ ${file##*.} =~ ^[A-Za-z0-9]{8}$ && ! -L $file && -f $file && -O $file ]] || continue
+        if ! meta=$(TZ=UTC0 LC_ALL=C stat -c '%h %z' -- "$file"); then
+            if present "$file"; then return 1; fi
+            continue
+        fi
+        [[ ${meta%% *} == 1 ]] || continue
+        copies+=("$file")
+        # cp -p conserva el mtime del original. El ctime permite ordenar las copias antiguas.
+        if [[ -z $new && ${meta#* } > $latest ]]; then
+            latest=${meta#* }
+            keep=$file
+        fi
+    done
+    for file in "${copies[@]}"; do
+        if [[ $file != "$keep" ]] && present "$file"; then
+            if ! find -P "$file" -maxdepth 0 -type f -uid "$UID" -links 1 -delete && present "$file"; then return 1; fi
+        fi
+    done
+}
+
 update_zshrc() (
-    local action=$1 file=$2 input=/dev/null tmp backup block=''
+    local action=$1 file=$2 input=/dev/null tmp snapshot='' backup='' block='' alias_line
     [[ $file == /* ]] || die 'ZDOTDIR debe ser una ruta absoluta.'
-    if [[ $action == uninstall && ! -e $file ]]; then return 0; fi
+    if [[ ( $action == uninstall || $action == funinstall ) && ! -e $file ]]; then return 0; fi
     if present "$file"; then
         [[ -f $file ]] || die "Ruta de configuración inesperada: $file"
         file=$(realpath -e -- "$file")
         input=$file
-        if [[ $action == uninstall ]] && ! grep -Fxq -e "$env_begin" -e "$env_end" -- "$file"; then return 0; fi
+        if [[ $action == uninstall ]] && ! grep -Fxq -e "$env_begin" -e "$env_end" \
+            -e "$alias_begin" -e "$alias_end" -- "$file"; then return 0; fi
+        if [[ $action == funinstall ]] && ! grep -Fxq -e "$env_begin" -e "$env_end" \
+            -e "$alias_begin" -e "$alias_end" -e "$begin" -e "$end" -- "$file"; then return 0; fi
     else
         mkdir -p -- "${file%/*}"
     fi
+    # Solo rota las copias presentes al empezar, también si otro puesto escribe en el mismo home.
+    local -a previous=("${file}.antes-de-fclean."????????)
     tmp=$(mktemp -- "${file}.fclean.XXXXXXXX")
-    trap 'rm -f -- "$tmp"' EXIT
-    if [[ $action == install ]]; then block=$(write_zsh_block); fi
-    FCLEAN_ZSH_BLOCK="$block" awk -v action="$action" -v old="$begin" -v oldEnd="$end" -v new="$env_begin" -v newEnd="$env_end" '
-            $0 == new || (action == "install" && $0 == old) {
+    trap 'rm -f -- "$tmp"; if [[ -n $snapshot ]]; then rm -f -- "$snapshot"; fi' EXIT
+    if [[ $action == install || $action == alias ]]; then block=$(write_zsh_block "$action"); fi
+    alias_line=$(write_zsh_alias "$installed")
+    FCLEAN_ZSH_BLOCK="$block" FCLEAN_ZSH_ALIAS="$alias_line" awk -v action="$action" -v old="$begin" -v oldEnd="$end" \
+        -v new="$env_begin" -v newEnd="$env_end" -v aliasBegin="$alias_begin" -v aliasEnd="$alias_end" '
+            $0 == new || $0 == aliasBegin || (action != "uninstall" && $0 == old) {
                 if (inside || seen[$0]++) exit 2
-                inside = ($0 == new ? newEnd : oldEnd)
-                if (action == "install" && !written++) print ENVIRON["FCLEAN_ZSH_BLOCK"]
+                inside = ($0 == new ? newEnd : ($0 == aliasBegin ? aliasEnd : oldEnd))
+                if (action == "alias" && inside != aliasEnd) print
+                else if ((action == "install" || action == "alias") && !written++) print ENVIRON["FCLEAN_ZSH_BLOCK"]
                 next
             }
-            $0 == newEnd || (action == "install" && $0 == oldEnd) {
+            $0 == newEnd || $0 == aliasEnd || (action != "uninstall" && $0 == oldEnd) {
                 if (inside != $0) exit 2
+                if (action == "alias" && inside != aliasEnd) print
                 inside = ""
+                next
+            }
+            inside && action == "alias" && inside != aliasEnd {
+                if ($0 ~ /^alias fclean=/) {
+                    if (!written++) print ENVIRON["FCLEAN_ZSH_ALIAS"]
+                } else print
+                next
+            }
+            inside && action == "uninstall" && /^alias fclean=/ {
+                if (!written++) {
+                    print aliasBegin
+                    print
+                    print aliasEnd
+                }
                 next
             }
             !inside { print }
             END {
                 if (inside) exit 2
-                if (action == "install" && !written) print ENVIRON["FCLEAN_ZSH_BLOCK"]
+                if ((action == "install" || action == "alias") && !written) print ENVIRON["FCLEAN_ZSH_BLOCK"]
             }
         ' "$input" > "$tmp" || die "Marcadores incompletos o repetidos en $file"
     if [[ -f $file ]]; then
-        if cmp -s -- "$file" "$tmp"; then return 0; fi
+        if cmp -s -- "$file" "$tmp"; then
+            if [[ $action != funinstall ]]; then rotate_zsh_backups '' "${previous[@]}"; fi
+            return 0
+        fi
         chmod --reference="$file" -- "$tmp"
-        backup=$(mktemp -- "${file}.antes-de-fclean.XXXXXXXX")
-        cp -p -- "$file" "$backup"
-        printf 'Copia de la configuración: %s\n' "$backup"
+        if [[ $action != funinstall ]]; then
+            snapshot=$(mktemp -- "${file}.fclean.XXXXXXXX")
+            cp -p -- "$file" "$snapshot"
+            backup="${file}.antes-de-fclean.${snapshot##*.}"
+            mv -nT -- "$snapshot" "$backup"
+            ! present "$snapshot" || die "Ya existe la copia $backup"
+            snapshot=''
+        fi
     fi
-    mv -T -- "$tmp" "$file"
+    if ! mv -T -- "$tmp" "$file"; then
+        if [[ -n $backup ]]; then rm -f -- "$backup"; fi
+        die "No se pudo guardar la configuración de Zsh en $file"
+    fi
+    if [[ -n $backup ]]; then
+        printf 'Copia de la configuración: %s\n' "$backup"
+        rotate_zsh_backups "$backup" "${previous[@]}"
+    fi
     printf 'Configuración de Zsh actualizada en %s\n' "$file"
 )
 
@@ -253,6 +333,10 @@ install_autostart() (
 )
 
 case $mode in
+    --alias)
+        update_zshrc alias "$zshrc"
+        printf 'Alias fclean configurado para %s. Abre una nueva terminal Zsh para usarlo.\n' "$installed"
+        exit 0 ;;
     --install) install_autostart; exit 0 ;;
     --uninstall)
         if present "$desktop"; then
@@ -263,7 +347,7 @@ case $mode in
         if [[ $zshrc != "$HOME/.zshrc" ]]; then update_zshrc uninstall "$HOME/.zshrc"; fi
         if present "$desktop"; then rm -- "$desktop"; fi
         printf 'Inicio automático desactivado.\n'
-        ;;
+        exit 0 ;;
 esac
 
 # Protege también montajes bind, que pueden tener el mismo número de dispositivo.
@@ -296,8 +380,12 @@ app_closed() {
 
 # Examina los archivos como datos, sin ejecutar el intérprete del entorno.
 inspect_home_venvs() {
-    python3 -IS - "$home" "$mode" "${mounts[@]}" <<'PY'
+    python3 -IS - "${1:-$home}" "$mode" "${mounts[@]}" <<'PY'
 import collections
+import fcntl
+import functools
+import hashlib
+import json
 import os
 import re
 import shutil
@@ -309,6 +397,8 @@ import time
 
 home, mode = sys.argv[1:3]
 force = mode == "--fclean"
+removing_tracking = mode == "--funinstall"
+scan_failed = False
 mounts = set(sys.argv[3:])
 uid = os.getuid()
 device = os.stat(home).st_dev
@@ -320,7 +410,7 @@ if force:
     ))
     if os.environ.get("VSCODE_EXTENSIONS"):
         pruned.add(os.path.realpath(os.environ["VSCODE_EXTENSIONS"]))
-if not force:
+if not force and not removing_tracking:
     pruned.update(os.path.join(home, path) for path in (
         ".cache", ".local/share/Trash", ".npm/_cacache", ".bun/install/cache",
         ".local/share/pypoetry/venv", ".local/share/pipx", ".local/pipx", ".local/share/uv/tools",
@@ -333,12 +423,27 @@ cutoff = time.time() - 5 * 24 * 60 * 60
 module = "_fclean_venv_usage_v1.py"
 startup = "fclean_venv_usage_v1.pth"
 running = ".fclean-running-"
+token_content = b"fclean-running-v3\n"
+token_name = re.compile(re.escape(running) + r"([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})\.([1-9][0-9]*)\.[a-z0-9_]{8}")
+legacy_hooks = {
+    "dae393ce8febaedee6a561dc8cf8f8a0b4af34ce24b7b0009c070971ae03dea2",  # marcadores vacíos
+    "866f136a39ae1bf70c4506a81c3e0583cdf115f5e89fc642dc6801fad6453e10",  # primer módulo con bloqueo
+}
 hook = b'''# Seguimiento de uso de este venv por fclean.
 import atexit
+import fcntl
 import os
 import tempfile
 
+_session = None
+
 def _record():
+    global _session
+    if _session is not None:  # A forked child must release its copy of the parent's descriptor.
+        inherited_fd = _session[2]
+        _session = None
+        if inherited_fd is not None:
+            os.close(inherited_fd)
     site = os.path.dirname(__file__)
     stamp = os.path.join(site, "fclean_venv_usage_v1.pth")
     os.utime(stamp, follow_symlinks=False)
@@ -346,19 +451,44 @@ def _record():
     with open("/proc/sys/kernel/random/boot_id", encoding="ascii") as stream:
         boot = stream.read().strip()
     fd, token = tempfile.mkstemp(prefix=f".fclean-running-{boot}.{pid}.", dir=site)
-    os.close(fd)
-    def finished():
-        if os.getpid() != pid:
-            return
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        if _locks_visible(fd):
+            os.write(fd, b"fclean-running-v3\\n")
+    except OSError:
+        os.close(fd)
+        fd = None
+    _session = pid, token, fd, stamp
+
+def _finish():
+    if _session is None:
+        return
+    pid, token, fd, stamp = _session
+    if os.getpid() != pid:
+        return
+    try:
+        os.utime(stamp, follow_symlinks=False)
+    except OSError:
+        pass
+    try:
+        os.unlink(token)
+    except OSError:
+        pass
+    if fd is not None:
         try:
-            os.utime(stamp, follow_symlinks=False)
+            os.close(fd)
         except OSError:
             pass
-        try:
-            os.unlink(token)
-        except OSError:
-            pass
-    atexit.register(finished)
+
+def _locks_visible(fd):
+    with open(f"/proc/self/fdinfo/{fd}", "rb") as stream:
+        mount_id = next((line.split()[1] for line in stream if line.startswith(b"mnt_id:")), None)
+    with open("/proc/self/mountinfo", "rb") as stream:
+        for line in stream:
+            if line.split(b" ", 1)[0] == mount_id:
+                fs, _, options = line.rsplit(b" - ", 1)[1].split()
+                return fs in @LOCKING_FS@ and not set(options.split(b",")).intersection(@LOCAL_LOCKS@)
+    return False
 
 def _try_record():
     try:
@@ -367,12 +497,17 @@ def _try_record():
         pass
 
 _try_record()
+atexit.register(_finish)
 os.register_at_fork(after_in_child=_try_record)
 '''
+# El creador y el lector del marcador usan la misma lista de montajes compatibles.
+locking_fs = (b"ext2", b"ext3", b"ext4", b"xfs", b"btrfs", b"tmpfs", b"overlay", b"zfs", b"nfs", b"nfs4")
+local_locks = (b"nolock", b"local_lock=all", b"local_lock=flock")
+hook = hook.replace(b"@LOCKING_FS@", repr(locking_fs).encode()).replace(b"@LOCAL_LOCKS@", repr(local_locks).encode())
 managed = {module: hook, startup: b"import _fclean_venv_usage_v1\n"}
 
 def venv_site(path, entries):
-    if not {"bin", "lib", "pyvenv.cfg"} <= entries or (mode != "--uninstall" and not entries <= venv_entries):
+    if not {"bin", "lib", "pyvenv.cfg"} <= entries or (not removing_tracking and not entries <= venv_entries):
         return False  # Por ejemplo, python -m venv . dentro de un proyecto con código.
     config = os.path.join(path, "pyvenv.cfg")
     if not stat.S_ISREG(os.lstat(config).st_mode):
@@ -427,6 +562,7 @@ def trusted_site(path, site):
 
 def tracking_files(site_fd, create, remove):
     missing = []
+    outdated = {}
     for name, expected in managed.items():
         try:
             fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=site_fd)
@@ -435,20 +571,63 @@ def tracking_files(site_fd, create, remove):
             continue
         with os.fdopen(fd, "rb") as stream:
             info = os.fstat(fd)
-            if (not stat.S_ISREG(info.st_mode) or info.st_uid != uid or info.st_nlink != 1
-                    or info.st_mode & 0o022 or stream.read(len(expected) + 1) != expected):
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != uid or info.st_nlink != 1 or info.st_mode & 0o022:
+                raise ValueError(f"archivo de seguimiento ajeno o modificado: {name!r}")
+            content = stream.read(len(expected) + 1)
+            if content == expected:
+                continue
+            if name == module and hashlib.sha256(content).hexdigest() in legacy_hooks:
+                outdated[name] = info
+            else:
                 raise ValueError(f"archivo de seguimiento ajeno o modificado: {name!r}")
     if remove:
+        # Desactiva el arranque antes de retirar el módulo, sin ejecutar el venv.
         for name in reversed(list(managed)):
             if name not in missing:
                 os.unlink(name, dir_fd=site_fd)
+        for name in os.listdir(site_fd):
+            check_session_token(site_fd, name, uninstall=True)
+        try:
+            cache_fd = os.open("__pycache__", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=site_fd)
+        except FileNotFoundError:
+            return not missing
+        try:
+            cache = os.fstat(cache_fd)
+            if cache.st_uid != uid or cache.st_dev != os.fstat(site_fd).st_dev:
+                raise ValueError("caché de Python con propietario o dispositivo inesperado")
+            removed_cache = False
+            for name in os.listdir(cache_fd):
+                if re.fullmatch(r"_fclean_venv_usage_v1\.cpython-\d+t?(?:\.opt-\d+)?\.pyc", name):
+                    info = os.stat(name, dir_fd=cache_fd, follow_symlinks=False)
+                    if stat.S_ISREG(info.st_mode) and info.st_uid == uid:
+                        os.unlink(name, dir_fd=cache_fd)
+                        removed_cache = True
+            empty = removed_cache and not os.listdir(cache_fd)
+        finally:
+            os.close(cache_fd)
+        if empty:
+            os.rmdir("__pycache__", dir_fd=site_fd)
     elif create:
-        for name in missing:  # El módulo se instala antes que el archivo de arranque.
-            with tempfile.NamedTemporaryFile(dir=f"/proc/self/fd/{site_fd}", prefix=".fclean-install-") as stream:
-                stream.write(managed[name])
-                stream.flush()
-                os.link(stream.name, name, dst_dir_fd=site_fd)
-    return not missing
+        for name in [*outdated, *missing]:  # El módulo se instala antes que el archivo de arranque.
+            fd, temp = tempfile.mkstemp(dir=f"/proc/self/fd/{site_fd}", prefix=".fclean-install-")
+            try:
+                with os.fdopen(fd, "wb") as stream:
+                    stream.write(managed[name])
+                if name in outdated:
+                    current = os.stat(name, dir_fd=site_fd, follow_symlinks=False)
+                    if not os.path.samestat(current, outdated[name]) or current.st_ctime_ns != outdated[name].st_ctime_ns:
+                        raise ValueError(f"el seguimiento cambió durante la actualización: {name!r}")
+                    os.replace(temp, name, dst_dir_fd=site_fd)
+                else:
+                    os.link(temp, name, dst_dir_fd=site_fd)
+            finally:
+                try:
+                    os.unlink(temp)
+                except FileNotFoundError:
+                    pass
+        if outdated:
+            os.utime(startup, dir_fd=site_fd, follow_symlinks=False)
+    return not missing and not outdated
 
 def check_tracking(site, create=False, remove=False):
     fd = os.open(site, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
@@ -459,19 +638,84 @@ def check_tracking(site, create=False, remove=False):
     finally:
         os.close(fd)
 
-def running_sessions(site):
-    tokens = [n for n in os.listdir(site) if n.startswith(running)]
-    if not tokens:
+@functools.lru_cache(maxsize=1)
+def can_check_remote_locks():
+    # El recorrido ya excluye otros montajes bajo home.
+    try:
+        fs, options = subprocess.check_output(
+            ["findmnt", "-nr", "-o", "FSTYPE,OPTIONS", "-T", home], stderr=subprocess.DEVNULL, timeout=3
+        ).split()
+        return fs in locking_fs and not set(options.split(b",")).intersection(local_locks)
+    except (OSError, ValueError, subprocess.SubprocessError):
         return False
-    with open("/proc/sys/kernel/random/boot_id", encoding="ascii") as stream:
-        prefix = running + stream.read().strip() + "."
-    for name in tokens:
-        pid = name[len(prefix):].split(".", 1)[0]
-        if mode == "--clean" and name.startswith(prefix) and pid.isdecimal() and not os.path.exists("/proc/" + pid):
-            # Un cierre abrupto en este puesto. Dar cinco días desde que se detecta.
-            os.utime(os.path.join(site, startup), follow_symlinks=False)
-            os.unlink(os.path.join(site, name))
-    return True
+
+@functools.lru_cache(maxsize=128)
+def previous_local_boot(boot):
+    # Un marcador vacío anterior a los bloqueos solo guarda el arranque y el PID.
+    try:
+        with open("/etc/machine-id", encoding="ascii") as stream:
+            machine = stream.read().strip()
+        hostname = os.uname().nodename
+        boot = boot.replace("-", "")
+        record = json.loads(subprocess.check_output(
+            ["journalctl", "--quiet", "--no-pager", "--boot=" + boot, "-n", "1", "-o", "json",
+             "--output-fields=_BOOT_ID,_MACHINE_ID,_HOSTNAME", "_MACHINE_ID=" + machine, "_HOSTNAME=" + hostname],
+            stderr=subprocess.DEVNULL, timeout=3))
+        return (isinstance(record, dict) and record.get("_MACHINE_ID") == machine
+                and record.get("_HOSTNAME") == hostname and record.get("_BOOT_ID") == boot)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return False
+
+def check_session_token(site_fd, name, current_boot=None, *, uninstall=False):
+    match = token_name.fullmatch(name)
+    if not match:
+        return
+    try:
+        entry = os.stat(name, dir_fd=site_fd, follow_symlinks=False)
+        if not stat.S_ISREG(entry.st_mode) or entry.st_uid != uid or entry.st_nlink != 1:
+            return
+        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=site_fd)
+        with os.fdopen(fd, "rb") as stream:
+            if not os.path.samestat(entry, os.fstat(fd)):
+                return
+            content = stream.read(len(token_content) + 1)
+            if content not in (b"", b"fclean-running-v2\n", token_content):
+                return
+            if not uninstall:
+                boot, pid = match.groups()
+                if content == token_content and (boot == current_boot or can_check_remote_locks()):
+                    try:
+                        fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                    except OSError:
+                        return  # Bloqueo activo o no verificable.
+                elif boot == current_boot:
+                    if os.path.exists("/proc/" + pid):
+                        return
+                elif not previous_local_boot(boot):
+                    path = os.path.join(os.readlink(f"/proc/self/fd/{site_fd}"), name)
+                    print(f"Marcador de otro equipo sin bloqueo verificable: {path!r}. "
+                          "Comprueba que su intérprete terminó antes de retirarlo.", file=sys.stderr)
+                    return
+            if os.path.samestat(entry, os.stat(name, dir_fd=site_fd, follow_symlinks=False)):
+                if not uninstall:
+                    # Concede cinco días completos desde que se detecta el cierre.
+                    os.utime(startup, dir_fd=site_fd, follow_symlinks=False)
+                os.unlink(name, dir_fd=site_fd)
+    except FileNotFoundError:
+        pass  # El intérprete puede haber salido durante la comprobación.
+
+def running_sessions(site):
+    site_fd = os.open(site, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        tokens = [n for n in os.listdir(site_fd) if n.startswith(running)]
+        if tokens and mode == "--clean":
+            with open("/proc/sys/kernel/random/boot_id", encoding="ascii") as stream:
+                current_boot = stream.read().strip()
+            for name in tokens:
+                check_session_token(site_fd, name, current_boot)
+        return bool(tokens)  # Incluso si se han retirado todos, esta ejecución conserva el venv.
+    finally:
+        os.close(site_fd)
 
 def active_locally(path, project):
     if os.path.realpath(os.environ.get("VIRTUAL_ENV", "")) == path:
@@ -524,14 +768,14 @@ def eligible_size(path, site, moved=False):
         for name in ([None] if base == path else []) + dirs + files:
             child = os.path.join(base, name) if name is not None else base
             info = os.lstat(child)
-            if info.st_uid != uid or info.st_dev != device or child in mounts or (name or "").startswith(".nfs"):
+            if info.st_uid != uid or info.st_dev != device or child in mounts or (name or "").startswith(".nfs") or name == ".fclean-keep":
                 return None
             if not force:
                 # El rename final cambia el ctime de la raíz aunque su contenido sea idéntico.
                 latest = info.st_mtime if moved and child == path else max(info.st_mtime, info.st_ctime)
                 if stat.S_ISREG(info.st_mode) and child not in metadata:
                     latest = max(latest, info.st_atime)
-                if latest > cutoff or (name or "").startswith(running) or name == ".fclean-keep":
+                if latest > cutoff or (name or "").startswith(running):
                     return None
             if not (stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode)):
                 return None
@@ -555,13 +799,24 @@ def contains_mount(path):
                 return True
     return False
 
+def keep_in_ancestors(path):
+    parent = os.path.dirname(path)
+    while parent != home and parent != os.path.dirname(parent):
+        try:
+            os.lstat(os.path.join(parent, ".fclean-keep"))
+            return True
+        except FileNotFoundError:
+            pass
+        parent = os.path.dirname(parent)
+    return False
+
 def inactive_project(path, site):
     project = project_for(path)
     if not project:
         if mode == "--dry-run":
             print(f"Venv conservado sin proyecto identificable: {path!r}", file=sys.stderr)
         return
-    if any(os.path.lexists(os.path.join(p, ".fclean-keep")) for p in (path, project)):
+    if os.path.lexists(os.path.join(path, ".fclean-keep")) or keep_in_ancestors(path):
         return
     if not check_tracking(site, mode == "--clean"):
         action = "Seguimiento iniciado" if mode == "--clean" else "Se iniciaría el seguimiento"
@@ -575,12 +830,17 @@ def inactive_project(path, site):
     return project
 
 def process_venv(path, site, identity):
+    global scan_failed
     if not trusted_site(path, site):
-        if mode == "--dry-run":
+        if mode == "--dry-run" or removing_tracking:
             print(f"Venv conservado por sus permisos o enlaces: {path!r}", file=sys.stderr)
+        if removing_tracking:
+            scan_failed = True
         return
-    if mode == "--uninstall":
+    if removing_tracking:
         check_tracking(site, remove=True)
+        return
+    if force and keep_in_ancestors(path):
         return
     project = None if force else inactive_project(path, site)
     if not force and not project:
@@ -598,7 +858,7 @@ def process_venv(path, site, identity):
             moved_site = os.path.join(moved, os.path.relpath(site, path))
             if (not os.path.samestat(identity, os.lstat(moved)) or contains_mount(moved) or
                     not trusted_site(moved, moved_site) or not set(os.listdir(moved)) <= venv_entries or
-                    eligible_size(moved, moved_site, moved=True) is None):
+                    eligible_size(moved, moved_site, moved=True) is None or keep_in_ancestors(path)):
                 raise ValueError("el entorno cambió durante la limpieza")
             if not force and (not project_quiet(project, path, staging) or not check_tracking(moved_site) or
                     os.stat(os.path.join(moved_site, startup)).st_mtime > cutoff):
@@ -615,6 +875,8 @@ def process_venv(path, site, identity):
     print(f"{size}\t{path!r} ({reason})")
 
 def scan_error(exc):
+    global scan_failed
+    scan_failed = True
     print(f"Se omite la búsqueda de venvs en {exc.filename!r}: {exc.strerror}", file=sys.stderr)
 
 for path, dirs, files in os.walk(home, onerror=scan_error, followlinks=False):
@@ -636,18 +898,119 @@ for path, dirs, files in os.walk(home, onerror=scan_error, followlinks=False):
         dirs[:] = [d for d in dirs if d not in {".git", ".hg", ".svn"}
                    and not d.startswith(".fclean-venv-")
                    and os.path.join(path, d) not in pruned
-                   and (force or (d != "node_modules" and
+                   and (force or removing_tracking or (d != "node_modules" and
                         not (d == "cache" and os.path.dirname(path) == os.path.join(home, ".var/app"))))]
     except OSError as exc:
         scan_error(exc)
         dirs.clear()
     except ValueError as exc:
+        scan_failed = True
         print(f"Se conserva {path!r}: {exc}", file=sys.stderr)
         dirs.clear()
+if removing_tracking and scan_failed:
+    sys.exit(1)
 PY
 }
 
-if [[ $mode == --uninstall ]]; then inspect_home_venvs; exit 0; fi
+# Solo retira archivos conocidos de la instalación y sus copias auxiliares.
+uninstall_files() {
+    python3 -IS - "$1" "$installed" "$runtime" "$zshrc" "$HOME/.zshrc" "${mounts[@]}" <<'PY'
+import glob
+import os
+import re
+import shutil
+import stat
+import sys
+
+phase, installed, runtime, zshrc, default_zshrc = sys.argv[1:6]
+mounts = set(sys.argv[6:])
+directory = os.path.dirname(installed)
+uid = os.getuid()
+signature = b"# fclean para las sesiones de usuario de Ubuntu del campus 42."
+
+def owned_entry(path):
+    info = os.lstat(path)
+    if info.st_uid != uid or not (stat.S_ISREG(info.st_mode) or stat.S_ISDIR(info.st_mode)):
+        raise ValueError(f"archivo ajeno, enlace o tipo inesperado: {path!r}")
+    return info
+
+def check_script(path):
+    owned_entry(path)
+    with open(path, "rb") as stream:
+        if signature not in stream.read(512).splitlines():
+            raise ValueError(f"el archivo no pertenece a fclean: {path!r}")
+
+def check_directory(path, *, installation=False):
+    info = owned_entry(path)
+    if not stat.S_ISDIR(info.st_mode):
+        raise ValueError(f"se esperaba un directorio: {path!r}")
+    physical = os.path.realpath(path)
+    if any(m == physical or m.startswith(physical + "/") for m in mounts):
+        raise ValueError(f"hay un montaje en la carpeta que se quiere retirar: {path!r}")
+    for name in os.listdir(path):
+        child = os.path.join(path, name)
+        entry = owned_entry(child)
+        if installation:
+            if re.fullmatch(r"\.fclean-update\.[A-Za-z0-9]{8}", name):
+                check_directory(child)
+                continue
+            known = name in {"fclean", "fclean.etag", "fclean.update.lock"} or re.fullmatch(
+                r"\.instalacion\.[A-Za-z0-9]{8}", name)
+        else:
+            known = name in {"script", "request", "etag", "state"}
+        if not known or not stat.S_ISREG(entry.st_mode):
+            raise ValueError(f"contenido inesperado en la instalación: {child!r}")
+        if installation and name == "fclean":
+            check_script(child)
+
+try:
+    if os.path.lexists(directory):
+        check_directory(directory, installation=True)
+    auxiliaries = set()
+    update_dirs = set()
+    for name in os.listdir(runtime):
+        path = os.path.join(runtime, name)
+        if re.fullmatch(r"fclean-[0-9a-f]{64}(?:\.etag|\.update\.lock)?", name):
+            info = owned_entry(path)
+            if not stat.S_ISREG(info.st_mode):
+                raise ValueError(f"copia de ejecución inesperada: {path!r}")
+            if re.fullmatch(r"fclean-[0-9a-f]{64}", name):
+                check_script(path)
+            auxiliaries.add(path)
+        elif re.fullmatch(r"\.fclean-initial\.[A-Za-z0-9]{8}", name):
+            if not stat.S_ISREG(owned_entry(path).st_mode):
+                raise ValueError(f"copia temporal inesperada: {path!r}")
+            auxiliaries.add(path)
+        elif re.fullmatch(r"\.fclean-update\.[A-Za-z0-9]{8}", name):
+            check_directory(path)
+            update_dirs.add(path)
+    prefixes = {os.path.join(os.path.dirname(directory), "autostart", ".42-fclean.")}
+    for file in {zshrc, default_zshrc, os.path.realpath(zshrc), os.path.realpath(default_zshrc)}:
+        prefixes.update((file + ".antes-de-fclean.", file + ".fclean."))
+    for prefix in prefixes:
+        for path in glob.glob(glob.escape(prefix) + "*"):
+            if re.fullmatch(r"[A-Za-z0-9]{8}", path[len(prefix):]):
+                if prefix.endswith(".antes-de-fclean."):
+                    info = os.lstat(path)
+                    if not stat.S_ISREG(info.st_mode) or info.st_uid != uid or info.st_nlink != 1:
+                        continue
+                if not stat.S_ISREG(owned_entry(path).st_mode):
+                    raise ValueError(f"copia de configuración inesperada: {path!r}")
+                auxiliaries.add(path)
+    if phase == "remove":
+        for path in sorted(auxiliaries):
+            os.unlink(path)
+        for path in sorted(update_dirs):
+            shutil.rmtree(path)
+        # El script puede estar ejecutándose desde esta misma carpeta.
+        if os.path.lexists(directory):
+            check_directory(directory, installation=True)
+            shutil.rmtree(directory)
+except (OSError, ValueError) as exc:
+    print(f"No se pudo completar la desinstalación de fclean: {exc}", file=sys.stderr)
+    sys.exit(1)
+PY
+}
 
 # Vacía el contenido desde el directorio ya validado. Las operaciones relativas
 # al descriptor evitan seguir un enlace si una entrada cambia durante el recorrido.
@@ -679,13 +1042,33 @@ def mount_id(fd):
     with open(f"/proc/self/fdinfo/{fd}", encoding="ascii") as info:
         return next(line for line in info if line.startswith("mnt_id:"))
 
+def venv_has_keep(fd, mount):
+    names = os.listdir(fd)
+    if ".fclean-keep" in names:
+        return True
+    for name in names:
+        try:
+            entry = os.stat(name, dir_fd=fd, follow_symlinks=False)
+            if stat.S_ISDIR(entry.st_mode):
+                child = os.open(name, flags, dir_fd=fd)
+                try:
+                    if os.path.samestat(entry, os.fstat(child)) and mount_id(child) == mount:
+                        if venv_has_keep(child, mount):
+                            return True
+                finally:
+                    os.close(child)
+        except FileNotFoundError:
+            continue
+    return False
+
 def clean(fd, relative, mount, apply):
     global files, blocks, directories
     if obsolete_extensions and not os.access(".", os.W_OK | os.X_OK, dir_fd=fd):
         return False
     names = os.listdir(fd)
-    if "pyvenv.cfg" in names and not (in_trash or obsolete_extensions or remove_cached_venvs):
-        return False
+    if "pyvenv.cfg" in names and not (in_trash or obsolete_extensions):
+        if not remove_cached_venvs or venv_has_keep(fd, mount):
+            return False
     if guarded and (markers.intersection(names) or {"HEAD", "objects", "refs"}.issubset(names)):
         return False
     empty = True
@@ -1207,7 +1590,13 @@ migrate_directory() (
     fi
     if [[ $mode == --dry-run ]]; then
         printf 'Migración opcional: %s -> %s\n' "$src" "$dst"
-        if [[ -d $src ]]; then du -shx -- "$src"; fi
+        if [[ -d $src ]]; then
+            local size kib
+            size=$(du -skx -- "$src")
+            kib=${size%%$'\t'*}
+            printf '%s\t%s\n' "$(format_size "$kib")" "$src"
+            printf '%s\n' "$kib" >&"$migration_report_fd"
+        fi
         return 0
     fi
     mkdir -p -- "$parent"
@@ -1249,22 +1638,55 @@ migrate_directory() (
 )
 
 preview_migration() {
+    local output_fd report_fd report_pid kib
     # Cada comprobación conserva errexit aunque su fallo no detenga la vista previa.
-    migrate_directory "$1" &
-    wait "$!" || notice "Se omite la migración opcional de $1."
+    # El tamaño viaja separado de los mensajes y de los nombres de archivo.
+    exec {output_fd}>&1
+    exec {report_fd}< <(
+        exec {migration_report_fd}>&1
+        migrate_directory "$1" >&"$output_fd"
+    )
+    report_pid=$!
+    exec {output_fd}>&-
+    while IFS= read -r kib; do
+        total_migration_kib=$((total_migration_kib + kib))
+    done <&"$report_fd"
+    exec {report_fd}<&-
+    wait "$report_pid" || notice "Se omite la migración opcional de $1."
 }
 
 code_processes='code|code-oss|code-insiders|codium'
+cache_migration_ready() {
+    [[ ! -d $home/.cache || -L $home/.cache ]] ||
+        app_closed "$code_processes|chrome|chromium|brave|firefox|firefox-bin|slack|discord|spotify|uv|bun|npm" \
+            'una aplicación que usa la caché'
+}
+
 case $mode in
+    --funinstall)
+        uninstall_files check
+        if present "$desktop"; then
+            [[ -f $desktop && ! -L $desktop ]] && grep -Fxq -- "$marker" "$desktop" ||
+                die "La entrada $desktop no pertenece a fclean."
+        fi
+        update_zshrc funinstall "$zshrc"
+        if [[ $zshrc != "$HOME/.zshrc" ]]; then update_zshrc funinstall "$HOME/.zshrc"; fi
+        if present "$desktop"; then rm -- "$desktop"; fi
+        inspect_home_venvs || die 'Quedan archivos de seguimiento por revisar. Se conserva la instalación para poder reintentarlo.'
+        if [[ -d $sgo ]] && sgo_available && trusted_destination "$sgo"; then
+            inspect_home_venvs "$(realpath -e -- "$sgo")" ||
+                die 'Quedan archivos de seguimiento por revisar en sgoinfre. Se conserva la instalación para poder reintentarlo.'
+        fi
+        uninstall_files remove
+        if [[ ! -L $lock && -O $lock && /proc/self/fd/9 -ef $lock ]]; then rm -- "$lock"; fi
+        printf 'Instalación de fclean eliminada, incluido el script.\n'
+        exit 0 ;;
     --prepare-env)
         ensure_sgo_directories "$sgo/.cache/uv" "$sgo/.cache/huggingface" "$sgo/.local/share"
         exit 0 ;;
     --migrate-cache)
         sgo_available || die "No se pudo verificar el almacenamiento de $sgo"
-        if [[ -d $home/.cache && ! -L $home/.cache ]]; then
-            app_closed "$code_processes|chrome|chromium|brave|firefox|firefox-bin|slack|discord|spotify|uv|bun|npm" \
-                'una aplicación que usa la caché' || exit 1
-        fi
+        cache_migration_ready || exit 1
         repair_link "$home/.cache" "$sgo/.cache"
         migrate_directory .cache
         exit 0 ;;
@@ -1347,7 +1769,15 @@ print_clean_summary() {
     '
 }
 
+print_dry_run_summary() {
+    printf '\nResumen estimado (--dry-run):\n'
+    printf '  Total por limpieza (home y sgoinfre): %s\n' "$(format_size "$total_cleaned_kib")"
+    printf '  Total por migración opcional (espacio liberado en home): %s\n' "$(format_size "$total_migration_kib")"
+    printf '  Estimaciones independientes: no se suman, pueden incluir el mismo contenido.\n'
+}
+
 total_cleaned_kib=0
+total_migration_kib=0
 if [[ $mode != --migrate ]]; then
     if [[ $mode == --dry-run ]]; then
         printf 'Contenido que se eliminaría:\n'
@@ -1400,9 +1830,13 @@ else
             if app_closed "$code_processes" 'la migración de extensiones de VS Code'; then
                 preview_migration .vscode/extensions
             fi
-            preview_migration .cache ;;
+            if cache_migration_ready; then
+                preview_migration .cache
+            fi ;;
     esac
 fi
 if [[ $mode == --clean || $mode == --fclean ]]; then
     print_clean_summary "$total_cleaned_kib"
+elif [[ $mode == --dry-run ]]; then
+    print_dry_run_summary
 fi
