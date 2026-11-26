@@ -1,0 +1,35 @@
+# Seguimiento de uso de este venv por fclean.
+import atexit
+import os
+import tempfile
+
+def _record():
+    site = os.path.dirname(__file__)
+    stamp = os.path.join(site, "fclean_venv_usage_v1.pth")
+    os.utime(stamp, follow_symlinks=False)
+    pid = os.getpid()
+    with open("/proc/sys/kernel/random/boot_id", encoding="ascii") as stream:
+        boot = stream.read().strip()
+    fd, token = tempfile.mkstemp(prefix=f".fclean-running-{boot}.{pid}.", dir=site)
+    os.close(fd)
+    def finished():
+        if os.getpid() != pid:
+            return
+        try:
+            os.utime(stamp, follow_symlinks=False)
+        except OSError:
+            pass
+        try:
+            os.unlink(token)
+        except OSError:
+            pass
+    atexit.register(finished)
+
+def _try_record():
+    try:
+        _record()
+    except OSError:
+        pass
+
+_try_record()
+os.register_at_fork(after_in_child=_try_record)

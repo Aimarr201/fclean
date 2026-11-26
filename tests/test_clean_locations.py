@@ -938,6 +938,65 @@ printf '%s' "$status"
         self.run_cli("--install")
         self.assertEqual(len(list(self.home.glob(".zshrc.antes-de-fclean.*"))), 1)
 
+    def test_zshrc_rotation_and_funinstall_respect_other_names_links_and_directories(self):
+        target = self.put("dotfiles/mi [zshrc]", "# personal\n")
+        (self.home / ".zshrc").symlink_to(target)
+        self.run_cli("--install")
+        before = target.read_bytes()
+        prefix = str(target) + ".antes-de-fclean."
+        note = Path(prefix + "copia-personal")
+        note.write_text("conservar")
+        directory = Path(prefix + "AAAA0001")
+        directory.mkdir()
+        link = Path(prefix + "AAAA0002")
+        link.symlink_to(note)
+        hardlink = Path(prefix + "AAAA0003")
+        os.link(note, hardlink)
+        self.run_cli("--uninstall")
+        candidates = set(target.parent.iterdir()) - {target, note, directory, link, hardlink}
+        backup, = candidates
+        self.assertEqual(backup.read_bytes(), before)
+        self.run_cli("--funinstall")
+        self.assertFalse(backup.exists())
+        self.assertTrue(directory.is_dir())
+        self.assertTrue(link.is_symlink())
+        self.assertTrue(hardlink.samefile(note))
+        self.assertEqual(note.read_text(), "conservar")
+
+    def test_idempotent_install_rotates_accumulated_backups_without_rewriting_zshrc(self):
+        self.run_cli("--install")
+        zshrc = self.home / ".zshrc"
+        original = zshrc.stat()
+        backups = [self.put(f".zshrc.antes-de-fclean.{suffix}", content)
+                   for suffix, content in (("AAA00001", "antigua"), ("AAA00002", "reciente"))]
+        # cp -p conserva la fecha del original, que puede ser anterior a la de otra copia.
+        os.utime(backups[0], (200, 200))
+        os.utime(backups[1], (100, 100))
+        expected = max(backups, key=lambda path: path.stat().st_ctime_ns)
+        self.run_cli("--install")
+        self.assertEqual(list(self.home.glob(".zshrc.antes-de-fclean.*")), [expected])
+        self.assertEqual((zshrc.stat().st_ino, zshrc.stat().st_mtime_ns), (original.st_ino, original.st_mtime_ns))
+
+    def test_failed_zshrc_copy_or_replace_retains_last_working_backup(self):
+        zshrc = self.put(".zshrc", "# original\n")
+        self.run_cli("--install")
+        before = zshrc.read_bytes()
+        prior, = self.home.glob(".zshrc.antes-de-fclean.*")
+        for command, failure in (("cp", "exit 1"), ("mv", 'for last do :; done\n'
+                                 'if [ "$last" = "$HOME/.zshrc" ]; then exit 1; fi\nexec /bin/mv "$@"')):
+            with self.subTest(command=command):
+                self.stub(command, failure)
+                result = self.run_cli("--uninstall", check=False)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(zshrc.read_bytes(), before)
+                self.assertEqual(list(self.home.glob(".zshrc.antes-de-fclean.*")), [prior])
+                self.assertEqual(prior.read_text(), "# original\n")
+                self.assertEqual(list(self.home.glob(".zshrc.fclean.*")), [])
+                (self.commands / command).unlink()
+        self.run_cli("--uninstall")
+        backup, = self.home.glob(".zshrc.antes-de-fclean.*")
+        self.assertEqual(backup.read_bytes(), before)
+
     @unittest.skipUnless(shutil.which("zsh"), "requiere Zsh para comprobar el entorno de arranque")
     def test_zsh_uses_verified_mount_and_discards_stale_exports(self):
         personal = self.mount_sgoinfre()
