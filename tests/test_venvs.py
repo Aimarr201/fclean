@@ -79,6 +79,47 @@ class VenvCleanupTests(unittest.TestCase):
         self.assertTrue(self.python.exists())
         self.assertTrue(self.stamp.exists())
 
+    def test_funinstall_removes_tracking_and_live_tokens_without_deleting_the_venv(self):
+        self.inspect("--clean")
+        (self.env / "entrega.ipynb").write_text("{}")
+        (self.project / ".fclean-keep").touch()
+        with subprocess.Popen([self.python, "-I", "-c", "print('listo', flush=True); input()"],
+                              stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True) as process:
+            try:
+                self.assertEqual(process.stdout.readline().strip(), "listo")
+                self.assertTrue(list(self.site.glob(".fclean-running-*")))
+                self.inspect("--funinstall")
+                self.assertFalse(self.stamp.exists())
+                self.assertFalse((self.site / "_fclean_venv_usage_v1.py").exists())
+                self.assertEqual(list(self.site.glob(".fclean-running-*")), [])
+                self.assertFalse((self.site / "__pycache__").exists())
+                self.assertIsNone(process.poll())
+                self.assertTrue(self.python.exists())
+                self.inspect("--funinstall")
+            finally:
+                process.terminate()
+        self.assertTrue((self.env / "entrega.ipynb").is_file())
+        self.assertTrue((self.project / ".fclean-keep").exists())
+
+    def test_funinstall_preserves_modified_tracking_and_reports_failure(self):
+        self.inspect("--clean")
+        original = self.stamp.read_bytes()
+        self.stamp.write_bytes(original + b"# cambio personal\n")
+        with self.assertRaises(subprocess.CalledProcessError) as error:
+            self.inspect("--funinstall")
+        self.assertIn("ajeno o modificado", error.exception.stderr)
+        self.assertEqual(self.stamp.read_bytes(), original + b"# cambio personal\n")
+        self.assertTrue((self.site / "_fclean_venv_usage_v1.py").is_file())
+        self.assertTrue(self.python.exists())
+
+    def test_funinstall_preserves_an_untracked_venv_and_its_empty_cache(self):
+        cache = self.site / "__pycache__"
+        cache.mkdir()
+        self.inspect("--funinstall")
+        self.assertTrue(cache.is_dir())
+        self.assertTrue(self.python.exists())
+        self.assertFalse(self.stamp.exists())
+
     def test_unassigned_or_mixed_directories(self):
         self.source.unlink()
         self.inspect("--clean", 10)

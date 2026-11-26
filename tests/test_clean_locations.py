@@ -898,7 +898,7 @@ printf '%s' "$status"
 
     def test_install_rejects_foreign_files_and_invalid_zsh_configuration(self):
         desktop = self.put(".config/autostart/42-fclean.desktop", "entrada ajena")
-        for option in ("--install", "--uninstall"):
+        for option in ("--install", "--uninstall", "--funinstall"):
             result = self.run_cli(option, check=False)
             self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
             self.assertEqual(desktop.read_text(), "entrada ajena")
@@ -942,13 +942,182 @@ printf '%s' "$status"
         self.assertTrue((venv / "bin/python").exists())
         self.assertFalse((self.home / ".config/autostart/42-fclean.desktop").exists())
 
+    @unittest.skipUnless(shutil.which("zsh"), "requiere Zsh para desinstalar desde el alias")
+    def test_funinstall_from_alias_removes_itself_tracking_backups_and_update_copies(self):
+        config = self.home / "config con espacios, dólar $, comilla ' y barra \\"
+        self.env["XDG_CONFIG_HOME"] = str(config)
+        original_zshrc = "export MI_VARIABLE=ejemplo\n"
+        actual_zshrc = self.put("dotfiles/zshrc", original_zshrc)
+        (self.home / ".zshrc").symlink_to(actual_zshrc)
+        self.run_cli("--install")
+        installed = config / "fclean/fclean"
+        project = self.put("proyecto/requirements.txt", "").parent
+        venv = project / ".venv"
+        self.run_command(sys.executable, "-I", "-m", "venv", "--without-pip", venv)
+        site = next(venv.glob("lib/python*/site-packages"))
+        self.run_command("bash", installed, "--clean")
+        self.run_command(venv / "bin/python", "-I", "-c", "pass")
+        self.assertTrue(list((site / "__pycache__").glob("_fclean_venv_usage_v1.*.pyc")))
+        unrelated_pyc = self.put("__pycache__/mi_modulo.pyc", base=site)
+        self.put("fclean.etag", 'hash\n"etag"\n', base=installed.parent)
+        source = self.put("descarga/fclean", SCRIPT.read_text())
+        self.run_command("bash", source, "--clean")
+        self.assertTrue(list(self.runtime.glob("fclean-*")))
+        self.assertTrue(list(actual_zshrc.parent.glob("zshrc.antes-de-fclean.*")))
+        cached = self.put(".cache/conservar")
+        personal = self.mount_sgoinfre()
+        remote = self.put(".cache/datos", base=personal)
+        elsewhere = self.new_directory()
+        result = self.run_command("zsh", "-ic", "fclean --funinstall", cwd=elsewhere)
+        self.assertIn("Instalación de fclean eliminada", result.stdout)
+        self.assertFalse(installed.parent.exists())
+        self.assertFalse((config / "autostart/42-fclean.desktop").exists())
+        self.assertEqual(actual_zshrc.read_text(), original_zshrc)
+        self.assertTrue((self.home / ".zshrc").is_symlink())
+        self.assertEqual(list(actual_zshrc.parent.glob("zshrc.antes-de-fclean.*")), [])
+        self.assertEqual(list(self.runtime.iterdir()), [])
+        self.assertFalse((site / "fclean_venv_usage_v1.pth").exists())
+        self.assertFalse((site / "_fclean_venv_usage_v1.py").exists())
+        self.assertEqual(list((site / "__pycache__").iterdir()), [unrelated_pyc])
+        self.assertTrue((venv / "bin/python").exists())
+        self.assertTrue(cached.is_file())
+        self.assertTrue(remote.is_file())
+        self.assertEqual(source.read_text(), SCRIPT.read_text())
+        self.assertNotEqual(self.run_command("zsh", "-ic", "alias fclean", check=False).returncode, 0)
+        self.run_cli("--funinstall")
+        self.assertFalse(installed.parent.exists())
+        self.assertEqual(list(self.runtime.iterdir()), [])
+
+    def test_funinstall_after_uninstall_removes_aliases_in_both_zsh_locations(self):
+        normal = self.put(".zshrc", "# predeterminada\n")
+        self.run_cli("--install")
+        dotdir = self.home / ".config/zsh"
+        custom = self.put(".config/zsh/.zshrc", "# personalizada\n")
+        self.env["ZDOTDIR"] = str(dotdir)
+        self.run_cli("--install")
+        self.run_cli("--uninstall")
+        self.assertIn("alias fclean=", custom.read_text())
+        installed = self.home / ".config/fclean/fclean"
+        self.run_command("bash", installed, "--funinstall")
+        self.assertEqual(normal.read_text(), "# predeterminada\n")
+        self.assertEqual(custom.read_text(), "# personalizada\n")
+        self.assertEqual(list(self.home.rglob("*.antes-de-fclean.*")), [])
+        self.assertFalse(installed.parent.exists())
+
+    def test_funinstall_removes_legacy_configuration_without_an_installation(self):
+        original = "# antes\n# después\n"
+        block = "# >>> 42-SGOINFRE-SHIELD >>>\nexport SGO=antiguo\n# <<< 42-SGOINFRE-SHIELD <<<\n"
+        zshrc = self.put(".zshrc", "# antes\n" + block + "# después\n")
+        self.run_cli("--funinstall")
+        self.assertEqual(zshrc.read_text(), original)
+        self.assertEqual(list(self.home.iterdir()), [zshrc])
+        self.assertEqual(list(self.runtime.iterdir()), [])
+
+    def test_funinstall_removes_tracking_from_a_venv_moved_to_sgoinfre(self):
+        personal = self.mount_sgoinfre()
+        project = self.put("proyecto/requirements.txt", "").parent
+        venv = project / ".venv"
+        self.run_command(sys.executable, "-I", "-m", "venv", "--without-pip", venv)
+        self.run_cli("--clean")
+        moved = personal / "entorno"
+        shutil.move(venv, moved)
+        venv.symlink_to(moved, target_is_directory=True)
+        stamp = next(moved.glob("lib/python*/site-packages/fclean_venv_usage_v1.pth"))
+        self.run_cli("--funinstall")
+        self.assertFalse(stamp.exists())
+        self.assertFalse((stamp.parent / "_fclean_venv_usage_v1.py").exists())
+        self.assertTrue(venv.is_symlink())
+        self.assertTrue((venv / "bin/python").exists())
+
+    def test_funinstall_refuses_foreign_files_in_the_installation_before_changing_config(self):
+        self.run_cli("--install")
+        zshrc = self.home / ".zshrc"
+        original = zshrc.read_text()
+        foreign = self.put(".config/fclean/mis-datos", "conservar")
+        result = self.run_cli("--funinstall", check=False)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("contenido inesperado", result.stderr)
+        self.assertEqual(foreign.read_text(), "conservar")
+        self.assertEqual(zshrc.read_text(), original)
+        self.assertTrue((foreign.parent / "fclean").is_file())
+        self.assertTrue((self.home / ".config/autostart/42-fclean.desktop").is_file())
+
+    def test_funinstall_refuses_a_symlinked_installation(self):
+        outside = self.new_directory()
+        source = self.put("fclean", SCRIPT.read_text(), base=outside)
+        config = self.home / ".config"
+        config.mkdir()
+        (config / "fclean").symlink_to(outside, target_is_directory=True)
+        result = self.run_cli("--funinstall", check=False)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertEqual(source.read_text(), SCRIPT.read_text())
+        self.assertTrue((config / "fclean").is_symlink())
+
+    def test_funinstall_refuses_broken_configuration_and_keeps_the_installed_script(self):
+        self.run_cli("--install")
+        zshrc = self.put(".zshrc", "# >>> fclean: entorno sgoinfre >>>\n")
+        original = zshrc.read_text()
+        result = self.run_cli("--funinstall", check=False)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertEqual(zshrc.read_text(), original)
+        self.assertTrue((self.home / ".config/fclean/fclean").is_file())
+        self.assertTrue((self.home / ".config/autostart/42-fclean.desktop").is_file())
+
+    def test_funinstall_cleans_interrupted_installation_files_without_following_links(self):
+        self.run_cli("--install")
+        temporary = (
+            ".config/fclean/.instalacion.ABC123ab",
+            ".config/fclean/.fclean-update.ABC123ab/script",
+            ".config/autostart/.42-fclean.ABC123ab",
+            ".zshrc.fclean.ABC123ab",
+        )
+        for relative in temporary:
+            self.put(relative, "copia interrumpida")
+        self.put(".fclean-initial.ABC123ab", "copia interrumpida", base=self.runtime)
+        self.put(".fclean-update.ABC123ab/state", "estado", base=self.runtime)
+        outside = self.put("conservar")
+        stage_script = self.home / temporary[1]
+        stage_script.unlink()
+        stage_script.symlink_to(outside)
+        result = self.run_cli("--funinstall", check=False)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertTrue((self.home / ".config/fclean/fclean").is_file())
+        self.assertEqual(outside.read_text(), "datos")
+        stage_script.unlink()
+        self.put(temporary[1], "copia interrumpida")
+        self.run_cli("--funinstall")
+        self.assertTrue(all(not (self.home / relative).exists() for relative in temporary))
+        self.assertEqual(list(self.runtime.iterdir()), [])
+        self.assertEqual(outside.read_text(), "datos")
+
+    def test_funinstall_keeps_the_script_when_tracking_cannot_be_removed(self):
+        project = self.put("proyecto/requirements.txt", "").parent
+        venv = project / ".venv"
+        self.run_command(sys.executable, "-I", "-m", "venv", "--without-pip", venv)
+        self.run_cli("--clean")
+        self.run_cli("--install")
+        stamp = next(venv.glob("lib/python*/site-packages/fclean_venv_usage_v1.pth"))
+        original = stamp.read_text()
+        stamp.write_text(original + "# cambio personal\n")
+        result = self.run_cli("--funinstall", check=False)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("Se conserva la instalación", result.stderr)
+        installed = self.home / ".config/fclean/fclean"
+        self.assertTrue(installed.is_file())
+        self.assertEqual(stamp.read_text(), original + "# cambio personal\n")
+        stamp.write_text(original)
+        self.run_command("bash", installed, "--funinstall")
+        self.assertFalse(installed.parent.exists())
+        self.assertFalse(stamp.exists())
+        self.assertTrue((venv / "bin/python").exists())
+
     def test_mutating_actions_respect_the_session_lock(self):
         import fcntl
 
         cached = self.put(".cache/visible")
         with (self.runtime / "42-fclean.lock").open("w") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            for option in ("--clean", "--fclean", "--migrate", "--migrate-cache", "--install", "--uninstall"):
+            for option in ("--clean", "--fclean", "--migrate", "--migrate-cache", "--install", "--uninstall", "--funinstall"):
                 with self.subTest(option=option):
                     result = self.run_cli(option, check=False)
                     self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
