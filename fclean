@@ -15,7 +15,7 @@ Uso: fclean [opción] o bash fclean [opción]
   --migrate        Traslada las extensiones de VS Code a sgoinfre.
   --migrate-cache  Traslada ~/.cache a sgoinfre.
   --install        Configura el alias en Zsh y la limpieza al iniciar sesión.
-  --uninstall      Retira la configuración y el seguimiento de venvs.
+  --uninstall      Retira el inicio automático y la configuración de sgoinfre; conserva el alias.
   -h, --help       Muestra esta ayuda, también disponible sin opciones.
 
 La limpieza borra datos sin confirmación. Cierra las aplicaciones antes de migrar.
@@ -52,6 +52,8 @@ begin='# >>> 42-SGOINFRE-SHIELD >>>'
 end='# <<< 42-SGOINFRE-SHIELD <<<'
 env_begin='# >>> fclean: entorno sgoinfre >>>'
 env_end='# <<< fclean: entorno sgoinfre <<<'
+alias_begin='# >>> fclean: alias >>>'
+alias_end='# <<< fclean: alias <<<'
 
 # El bloqueo local también funciona cuando la cuota del home está agotada.
 resumed_clean=false
@@ -160,6 +162,12 @@ has_legacy_block() {
 write_zsh_block() {
     local installed_command
     printf -v installed_command '/bin/bash %q' "$installed"
+    if [[ $1 == uninstall ]]; then
+        printf '%s\n' "$alias_begin"
+        printf 'alias fclean=%q\n' "$installed_command"
+        printf '%s\n' "$alias_end"
+        return
+    fi
     printf '%s\n' "$env_begin"
     printf 'if %s --prepare-env; then\n' "$installed_command"
     cat <<'ZSH'
@@ -189,21 +197,23 @@ update_zshrc() (
         [[ -f $file ]] || die "Ruta de configuración inesperada: $file"
         file=$(realpath -e -- "$file")
         input=$file
-        if [[ $action == uninstall ]] && ! grep -Fxq -e "$env_begin" -e "$env_end" -- "$file"; then return 0; fi
+        if [[ $action == uninstall ]] && ! grep -Fxq -e "$env_begin" -e "$env_end" \
+            -e "$alias_begin" -e "$alias_end" -- "$file"; then return 0; fi
     else
         mkdir -p -- "${file%/*}"
     fi
     tmp=$(mktemp -- "${file}.fclean.XXXXXXXX")
     trap 'rm -f -- "$tmp"' EXIT
-    if [[ $action == install ]]; then block=$(write_zsh_block); fi
-    FCLEAN_ZSH_BLOCK="$block" awk -v action="$action" -v old="$begin" -v oldEnd="$end" -v new="$env_begin" -v newEnd="$env_end" '
-            $0 == new || (action == "install" && $0 == old) {
+    block=$(write_zsh_block "$action")
+    FCLEAN_ZSH_BLOCK="$block" awk -v action="$action" -v old="$begin" -v oldEnd="$end" \
+        -v new="$env_begin" -v newEnd="$env_end" -v aliasBegin="$alias_begin" -v aliasEnd="$alias_end" '
+            $0 == new || $0 == aliasBegin || (action == "install" && $0 == old) {
                 if (inside || seen[$0]++) exit 2
-                inside = ($0 == new ? newEnd : oldEnd)
-                if (action == "install" && !written++) print ENVIRON["FCLEAN_ZSH_BLOCK"]
+                inside = ($0 == new ? newEnd : ($0 == aliasBegin ? aliasEnd : oldEnd))
+                if (!written++) print ENVIRON["FCLEAN_ZSH_BLOCK"]
                 next
             }
-            $0 == newEnd || (action == "install" && $0 == oldEnd) {
+            $0 == newEnd || $0 == aliasEnd || (action == "install" && $0 == oldEnd) {
                 if (inside != $0) exit 2
                 inside = ""
                 next
@@ -263,7 +273,7 @@ case $mode in
         if [[ $zshrc != "$HOME/.zshrc" ]]; then update_zshrc uninstall "$HOME/.zshrc"; fi
         if present "$desktop"; then rm -- "$desktop"; fi
         printf 'Inicio automático desactivado.\n'
-        ;;
+        exit 0 ;;
 esac
 
 # Protege también montajes bind, que pueden tener el mismo número de dispositivo.
@@ -372,7 +382,7 @@ os.register_at_fork(after_in_child=_try_record)
 managed = {module: hook, startup: b"import _fclean_venv_usage_v1\n"}
 
 def venv_site(path, entries):
-    if not {"bin", "lib", "pyvenv.cfg"} <= entries or (mode != "--uninstall" and not entries <= venv_entries):
+    if not {"bin", "lib", "pyvenv.cfg"} <= entries or not entries <= venv_entries:
         return False  # Por ejemplo, python -m venv . dentro de un proyecto con código.
     config = os.path.join(path, "pyvenv.cfg")
     if not stat.S_ISREG(os.lstat(config).st_mode):
@@ -425,7 +435,7 @@ def trusted_site(path, site):
         current = os.path.dirname(current)
     return os.path.realpath(path) == path
 
-def tracking_files(site_fd, create, remove):
+def tracking_files(site_fd, create):
     missing = []
     for name, expected in managed.items():
         try:
@@ -438,11 +448,7 @@ def tracking_files(site_fd, create, remove):
             if (not stat.S_ISREG(info.st_mode) or info.st_uid != uid or info.st_nlink != 1
                     or info.st_mode & 0o022 or stream.read(len(expected) + 1) != expected):
                 raise ValueError(f"archivo de seguimiento ajeno o modificado: {name!r}")
-    if remove:
-        for name in reversed(list(managed)):
-            if name not in missing:
-                os.unlink(name, dir_fd=site_fd)
-    elif create:
+    if create:
         for name in missing:  # El módulo se instala antes que el archivo de arranque.
             with tempfile.NamedTemporaryFile(dir=f"/proc/self/fd/{site_fd}", prefix=".fclean-install-") as stream:
                 stream.write(managed[name])
@@ -450,12 +456,12 @@ def tracking_files(site_fd, create, remove):
                 os.link(stream.name, name, dst_dir_fd=site_fd)
     return not missing
 
-def check_tracking(site, create=False, remove=False):
+def check_tracking(site, create=False):
     fd = os.open(site, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:
         if os.readlink(f"/proc/self/fd/{fd}") != site:
             raise ValueError("el directorio de paquetes cambió durante la comprobación")
-        return tracking_files(fd, create, remove)
+        return tracking_files(fd, create)
     finally:
         os.close(fd)
 
@@ -579,9 +585,6 @@ def process_venv(path, site, identity):
         if mode == "--dry-run":
             print(f"Venv conservado por sus permisos o enlaces: {path!r}", file=sys.stderr)
         return
-    if mode == "--uninstall":
-        check_tracking(site, remove=True)
-        return
     project = None if force else inactive_project(path, site)
     if not force and not project:
         return
@@ -646,8 +649,6 @@ for path, dirs, files in os.walk(home, onerror=scan_error, followlinks=False):
         dirs.clear()
 PY
 }
-
-if [[ $mode == --uninstall ]]; then inspect_home_venvs; exit 0; fi
 
 # Vacía el contenido desde el directorio ya validado. Las operaciones relativas
 # al descriptor evitan seguir un enlace si una entrada cambia durante el recorrido.

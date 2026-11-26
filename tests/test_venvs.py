@@ -72,14 +72,12 @@ class VenvCleanupTests(unittest.TestCase):
         self.assertTrue(self.python.exists())
         self.assertFalse(list(self.site.glob(".fclean-running-*")))
 
-    def test_keep_and_uninstall(self):
+    def test_keep_protects_venv_and_preserves_tracking(self):
         self.inspect("--clean")
         (self.project / ".fclean-keep").touch()
         self.inspect("--clean", 12)
         self.assertTrue(self.python.exists())
-        self.inspect("--uninstall")
-        self.assertFalse(self.stamp.exists())
-        self.assertTrue(self.python.exists())
+        self.assertTrue(self.stamp.exists())
 
     def test_unassigned_or_mixed_directories(self):
         self.source.unlink()

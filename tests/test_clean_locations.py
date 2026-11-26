@@ -768,12 +768,49 @@ printf '%s' "$status"
         self.run_cli("--install")
         self.assertEqual(custom.read_text(), original_block)
         self.assertEqual(list(self.home.glob("zshrc-real.antes-de-fclean.*")), backups)
+        cached = self.put(".cache/conservar")
         self.run_command("zsh", "-ic", "fclean --uninstall", cwd=elsewhere)
+        manual_block = custom.read_text()
+        backups = list(self.home.glob("zshrc-real.antes-de-fclean.*"))
         self.run_cli("--uninstall")
         self.assertFalse(desktop.exists())
         self.assertTrue(zshrc.is_symlink())
-        self.assertEqual(custom.read_text(), "export MI_VARIABLE=ejemplo\n")
-        self.assertNotEqual(self.run_command("zsh", "-ic", "alias fclean", check=False).returncode, 0)
+        self.assertTrue(manual_block.startswith("export MI_VARIABLE=ejemplo\n"))
+        alias_line = next(line for line in original_block.splitlines() if line.startswith("alias fclean="))
+        self.assertEqual(manual_block.count(alias_line), 1)
+        self.assertNotIn("--prepare-env", manual_block)
+        self.assertNotIn("XDG_CACHE_HOME", manual_block)
+        self.assertEqual(custom.read_text(), manual_block)
+        self.assertEqual(list(self.home.glob("zshrc-real.antes-de-fclean.*")), backups)
+        self.assertEqual(self.run_command("zsh", "-ic", "fclean --help", cwd=elsewhere).stdout, help_text)
+        self.assertTrue(cached.is_file())
+        self.run_command("zsh", "-ic", "fclean --install", cwd=elsewhere)
+        self.assertEqual(custom.read_text(), original_block)
+        self.assertTrue(desktop.is_file())
+        self.run_command("zsh", "-ic", "fclean --uninstall", cwd=elsewhere)
+        self.assertEqual(custom.read_text(), manual_block)
+
+    @unittest.skipUnless(shutil.which("zsh"), "requiere Zsh para comprobar el entorno")
+    def test_uninstall_stops_sgoinfre_setup_but_keeps_the_alias(self):
+        personal = self.mount_sgoinfre()
+        self.run_cli("--install")
+        names = ("SGO", "XDG_CACHE_HOME", "XDG_DATA_HOME", "UV_CACHE_DIR", "HF_HOME")
+        probe = "printf '%s\\n' " + " ".join(f'"${{{name}:-sin-definir}}"' for name in names)
+        self.assertNotIn("sin-definir", self.run_command("zsh", "-ic", probe).stdout)
+        self.run_cli("--uninstall")
+        shutil.rmtree(personal)
+        self.assertEqual(self.run_command("zsh", "-ic", probe).stdout.splitlines(), ["sin-definir"] * len(names))
+        self.assertIn("Uso:", self.run_command("zsh", "-ic", "fclean --help").stdout)
+        self.assertFalse(personal.exists())
+
+    def test_uninstall_without_installation_leaves_user_configuration_alone(self):
+        self.run_cli("--uninstall")
+        self.assertEqual(list(self.home.iterdir()), [])
+        original = "export MI_VARIABLE=ejemplo\nalias fclean='echo personal'\n"
+        zshrc = self.put(".zshrc", original)
+        self.run_cli("--uninstall")
+        self.assertEqual(zshrc.read_text(), original)
+        self.assertEqual(list(self.home.glob(".zshrc.antes-de-fclean.*")), [])
 
     @unittest.skipUnless(shutil.which("zsh"), "requiere Zsh para comprobar el entorno de arranque")
     def test_zsh_uses_verified_mount_and_discards_stale_exports(self):
@@ -805,7 +842,9 @@ printf '%s' "$status"
         self.run_command("zsh", "-ic", "fclean --install")
         self.assertEqual(custom.read_text().count("alias fclean="), 1)
         self.run_command("zsh", "-ic", "fclean --uninstall")
-        self.assertNotIn("alias fclean=", custom.read_text())
+        self.assertEqual(custom.read_text().count("alias fclean="), 1)
+        self.assertNotIn("--prepare-env", custom.read_text())
+        self.assertIn("Uso:", self.run_command("zsh", "-ic", "fclean --help").stdout)
         self.assertEqual(normal.read_text(), "# configuración predeterminada\n")
 
     def test_uninstall_from_custom_zsh_directory_removes_the_old_default_block(self):
@@ -816,8 +855,10 @@ printf '%s' "$status"
         self.env["ZDOTDIR"] = str(dotdir)
         self.run_cli("--install")
         self.run_cli("--uninstall")
-        self.assertEqual(normal.read_text(), "# configuración predeterminada\n")
-        self.assertNotIn("alias fclean=", (dotdir / ".zshrc").read_text())
+        self.assertTrue(normal.read_text().startswith("# configuración predeterminada\n"))
+        for file in (normal, dotdir / ".zshrc"):
+            self.assertEqual(file.read_text().count("alias fclean="), 1)
+            self.assertNotIn("--prepare-env", file.read_text())
 
     def test_autostart_escapes_tab_and_backslash_in_the_working_directory(self):
         config = self.home / "config\tcon tabulador y barra \\"
@@ -838,7 +879,12 @@ printf '%s' "$status"
         self.assertIn("alias fclean=", updated)
         self.assertNotIn("antiguo", updated)
         self.run_cli("--uninstall")
-        self.assertEqual(zshrc.read_text(), "# antes\n# después\n")
+        manual = zshrc.read_text()
+        self.assertTrue(manual.startswith("# antes\n"))
+        self.assertTrue(manual.endswith("# después\n"))
+        self.assertEqual(manual.count("alias fclean="), 1)
+        self.assertNotIn("--prepare-env", manual)
+        self.assertNotIn("antiguo", manual)
 
     def test_uninstall_disables_autostart_when_zshrc_target_is_missing(self):
         zshrc = self.home / ".zshrc"
@@ -869,7 +915,7 @@ printf '%s' "$status"
         self.assertFalse(desktop.exists())
         self.assertFalse(installed.exists())
 
-    def test_cli_previews_installs_and_removes_venv_tracking(self):
+    def test_uninstall_preserves_venv_tracking_script_and_migrated_data(self):
         project = self.put("proyecto/requirements.txt", "").parent
         venv = project / ".venv"
         self.run_command(sys.executable, "-I", "-m", "venv", "--without-pip", venv)
@@ -879,10 +925,22 @@ printf '%s' "$status"
         self.assertFalse(stamp.exists())
         self.assertIn("Seguimiento iniciado", self.run_cli("--clean").stderr)
         self.assertTrue(stamp.is_file())
+        personal = self.mount_sgoinfre()
+        cached = self.put(".cache/archivo", base=personal)
+        (self.home / ".cache").symlink_to(personal / ".cache", target_is_directory=True)
+        self.run_cli("--install")
+        installed = self.home / ".config/fclean/fclean"
+        tracked = (stamp, site / "_fclean_venv_usage_v1.py", installed, cached)
+        original = {path: (path.read_bytes(), path.stat().st_mtime_ns, path.stat().st_ino) for path in tracked}
+        # Desinstalar ya no necesita Python ni recorre los venvs o los montajes.
+        self.stub("python3", "exit 1")
+        self.stub("findmnt", "exit 1")
         self.run_cli("--uninstall")
-        self.assertFalse(stamp.exists())
-        self.assertFalse((site / "_fclean_venv_usage_v1.py").exists())
+        self.assertEqual({path: (path.read_bytes(), path.stat().st_mtime_ns, path.stat().st_ino)
+                          for path in tracked}, original)
+        self.assertTrue((self.home / ".cache").is_symlink())
         self.assertTrue((venv / "bin/python").exists())
+        self.assertFalse((self.home / ".config/autostart/42-fclean.desktop").exists())
 
     def test_mutating_actions_respect_the_session_lock(self):
         import fcntl
