@@ -80,6 +80,87 @@ class CleanLocationsTests(unittest.TestCase):
         path.write_text(content)
         return path
 
+    def allocated_kib(self, *paths):
+        entries = {(info.st_dev, info.st_ino): info.st_blocks
+                   for path in paths for info in (path.lstat(),)}
+        return (sum(entries.values()) + 1) // 2
+
+    def assert_preview_summary(self, output, *, cleanup, migration):
+        summary = output.split("Resumen estimado (--dry-run):\n", 1)[1]
+        # Estos casos usan archivos pequeños para comparar las cantidades sin redondeo.
+        self.assertLess(max(cleanup, migration), 1024)
+        cleanup_text = f"{cleanup} KiB" if cleanup else "0 B"
+        migration_text = f"{migration} KiB" if migration else "0 B"
+        self.assertIn(f"Total por limpieza (home y sgoinfre): {cleanup_text}\n", summary)
+        self.assertIn(f"Total por migración opcional (espacio liberado en home): {migration_text}\n", summary)
+        self.assertTrue(summary.endswith(
+            "  Estimaciones independientes: no se suman, pueden incluir el mismo contenido.\n"))
+
+    def test_preview_summary_with_nothing_to_clean_or_migrate(self):
+        self.assert_preview_summary(self.run_cli("--dry-run").stdout, cleanup=0, migration=0)
+        self.assertEqual(list(self.home.iterdir()), [])
+        self.mount_sgoinfre()
+        self.assert_preview_summary(self.run_cli("--dry-run").stdout, cleanup=0, migration=0)
+        self.assertFalse((self.home / ".cache").exists())
+        self.assertFalse((self.home / ".vscode").exists())
+
+    def test_preview_summary_without_sgoinfre_still_totals_cleanup(self):
+        cached = self.put(".cache/archivo")
+        npm = self.put(".npm/_cacache/paquete")
+        self.assert_preview_summary(self.run_cli("--dry-run").stdout,
+                                    cleanup=self.allocated_kib(cached, npm), migration=0)
+        self.assertTrue(cached.is_file())
+        self.assertTrue(npm.is_file())
+        self.assertFalse((self.runtime / "42-fclean.lock").exists())
+
+    def test_preview_summary_totals_both_optional_migrations_independently(self):
+        personal = self.mount_sgoinfre()
+        cached = self.put(".cache/archivo con espacio\ny salto")
+        linked = cached.with_name("enlace duro")
+        os.link(cached, linked)
+        package = self.put(".vscode/extensions/ejemplo.editor/package.json", "{}")
+        migrated = self.allocated_kib(cached.parent, cached, linked,
+                                     package.parent.parent, package.parent, package)
+        self.assert_preview_summary(self.run_cli("--dry-run").stdout,
+                                    cleanup=self.allocated_kib(cached), migration=migrated)
+        self.assertTrue(cached.samefile(linked))
+        self.assertTrue(package.is_file())
+        self.assertEqual(list(personal.iterdir()), [])
+
+    def test_preview_summary_does_not_count_already_migrated_links(self):
+        personal = self.mount_sgoinfre()
+        cached = self.put(".cache/archivo", base=personal)
+        self.put(".vscode/extensions/ejemplo.editor/package.json", "{}", base=personal)
+        for relative in (".cache", ".vscode/extensions"):
+            source = self.home / relative
+            source.parent.mkdir(parents=True, exist_ok=True)
+            source.symlink_to(personal / relative, target_is_directory=True)
+        self.assert_preview_summary(self.run_cli("--dry-run").stdout,
+                                    cleanup=self.allocated_kib(cached), migration=0)
+        self.assertTrue(cached.is_file())
+        self.assertTrue((self.home / ".cache").is_symlink())
+
+    @unittest.skipUnless(shutil.which("rsync"), "requiere rsync para detectar conflictos de caché")
+    def test_preview_summary_excludes_only_the_conflicting_migration(self):
+        personal = self.mount_sgoinfre()
+        cached = self.put(".cache/archivo", "igual")
+        package = self.put(".vscode/extensions/ejemplo.editor/package.json", "igual")
+        remote_cache = self.put(".cache/archivo", "igual", base=personal)
+        remote_package = self.put(".vscode/extensions/ejemplo.editor/package.json", "igual", base=personal)
+        cleanup = self.allocated_kib(cached, remote_cache)
+        for conflicting, migratable in (
+                (remote_cache, (package.parent.parent, package.parent, package)),
+                (remote_package, (cached.parent, cached))):
+            with self.subTest(conflict=conflicting):
+                conflicting.write_text("distinto")
+                preview = self.run_cli("--dry-run")
+                self.assertIn("Se omite la migración opcional", preview.stderr)
+                self.assert_preview_summary(preview.stdout, cleanup=cleanup,
+                                            migration=self.allocated_kib(*migratable))
+                conflicting.write_text("igual")
+        self.assertEqual(cached.read_text(), "igual")
+        self.assertEqual(package.read_text(), "igual")
+
     def stub_update_server(self):
         self.stub("curl", r'''
 while [ "$#" -gt 0 ]; do
@@ -525,6 +606,8 @@ printf '%s' "$status"
         cached = self.put(".cache/local")
         extension = self.put(".vscode/extensions/ejemplo.editor/package.json")
         self.stub("pgrep", "exit 0")
+        self.assert_preview_summary(self.run_cli("--dry-run").stdout,
+                                    cleanup=self.allocated_kib(cached), migration=0)
         for option in ("--migrate", "--migrate-cache"):
             with self.subTest(option=option):
                 result = self.run_cli(option, check=False)
@@ -577,6 +660,7 @@ printf '%s' "$status"
         self.assertTrue(settings.is_file())
         self.assertEqual(os.readlink(inner), "../settings.json")
         self.assertEqual(list(personal.iterdir()), [])
+        self.assert_preview_summary(self.run_cli("--dry-run").stdout, cleanup=0, migration=0)
 
     def test_failed_migration_restores_the_original_name_and_allows_retry(self):
         personal = self.mount_sgoinfre()

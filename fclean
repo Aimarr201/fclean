@@ -1207,7 +1207,13 @@ migrate_directory() (
     fi
     if [[ $mode == --dry-run ]]; then
         printf 'Migración opcional: %s -> %s\n' "$src" "$dst"
-        if [[ -d $src ]]; then du -shx -- "$src"; fi
+        if [[ -d $src ]]; then
+            local size kib
+            size=$(du -skx -- "$src")
+            kib=${size%%$'\t'*}
+            printf '%s\t%s\n' "$(format_size "$kib")" "$src"
+            printf '%s\n' "$kib" >&"$migration_report_fd"
+        fi
         return 0
     fi
     mkdir -p -- "$parent"
@@ -1249,22 +1255,37 @@ migrate_directory() (
 )
 
 preview_migration() {
+    local output_fd report_fd report_pid kib
     # Cada comprobación conserva errexit aunque su fallo no detenga la vista previa.
-    migrate_directory "$1" &
-    wait "$!" || notice "Se omite la migración opcional de $1."
+    # El tamaño viaja separado de los mensajes y de los nombres de archivo.
+    exec {output_fd}>&1
+    exec {report_fd}< <(
+        exec {migration_report_fd}>&1
+        migrate_directory "$1" >&"$output_fd"
+    )
+    report_pid=$!
+    exec {output_fd}>&-
+    while IFS= read -r kib; do
+        total_migration_kib=$((total_migration_kib + kib))
+    done <&"$report_fd"
+    exec {report_fd}<&-
+    wait "$report_pid" || notice "Se omite la migración opcional de $1."
 }
 
 code_processes='code|code-oss|code-insiders|codium'
+cache_migration_ready() {
+    [[ ! -d $home/.cache || -L $home/.cache ]] ||
+        app_closed "$code_processes|chrome|chromium|brave|firefox|firefox-bin|slack|discord|spotify|uv|bun|npm" \
+            'una aplicación que usa la caché'
+}
+
 case $mode in
     --prepare-env)
         ensure_sgo_directories "$sgo/.cache/uv" "$sgo/.cache/huggingface" "$sgo/.local/share"
         exit 0 ;;
     --migrate-cache)
         sgo_available || die "No se pudo verificar el almacenamiento de $sgo"
-        if [[ -d $home/.cache && ! -L $home/.cache ]]; then
-            app_closed "$code_processes|chrome|chromium|brave|firefox|firefox-bin|slack|discord|spotify|uv|bun|npm" \
-                'una aplicación que usa la caché' || exit 1
-        fi
+        cache_migration_ready || exit 1
         repair_link "$home/.cache" "$sgo/.cache"
         migrate_directory .cache
         exit 0 ;;
@@ -1347,7 +1368,15 @@ print_clean_summary() {
     '
 }
 
+print_dry_run_summary() {
+    printf '\nResumen estimado (--dry-run):\n'
+    printf '  Total por limpieza (home y sgoinfre): %s\n' "$(format_size "$total_cleaned_kib")"
+    printf '  Total por migración opcional (espacio liberado en home): %s\n' "$(format_size "$total_migration_kib")"
+    printf '  Estimaciones independientes: no se suman, pueden incluir el mismo contenido.\n'
+}
+
 total_cleaned_kib=0
+total_migration_kib=0
 if [[ $mode != --migrate ]]; then
     if [[ $mode == --dry-run ]]; then
         printf 'Contenido que se eliminaría:\n'
@@ -1400,9 +1429,13 @@ else
             if app_closed "$code_processes" 'la migración de extensiones de VS Code'; then
                 preview_migration .vscode/extensions
             fi
-            preview_migration .cache ;;
+            if cache_migration_ready; then
+                preview_migration .cache
+            fi ;;
     esac
 fi
 if [[ $mode == --clean || $mode == --fclean ]]; then
     print_clean_summary "$total_cleaned_kib"
+elif [[ $mode == --dry-run ]]; then
+    print_dry_run_summary
 fi
