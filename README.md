@@ -7,20 +7,14 @@
 Descarga el archivo `fclean` en `~/.config/fclean/`:
 
 ```bash
-wget -P ~/.config/fclean/fclean https://raw.githubusercontent.com/Aimarr201/fclean/main/fclean
+wget -P ~/.config/fclean https://raw.githubusercontent.com/Aimarr201/fclean/main/fclean
 ```
 
-Antes de activar la limpieza automática, puedes revisar qué se borraría sin modificar ningún archivo:
-
-```bash
-bash ~/.config/fclean/fclean --dry-run
-```
 
 ## Instalación recomendada
 
-Para el uso habitual, se recomienda usar `--install`. Añade el alias `fclean` a la terminal y activa `--clean` al iniciar sesión gráfica.
+Para el uso habitual, se recomienda usar `--install`. Esto añade el alias `fclean` a la terminal y activa `--clean` cada inicio de sesión.
 
-Antes de limpiar, el script comprueba si hay una versión nueva. Si la encuentra, la descarga, la valida y la ejecuta, también al iniciar sesión. Si falla la actualización, usa la copia disponible.
 
 ```bash
 bash ~/.config/fclean/fclean --install
@@ -28,22 +22,24 @@ bash ~/.config/fclean/fclean --install
 
 Abre una nueva terminal para usar el alias desde cualquier carpeta. Ejecuta `fclean --clean` si quieres limpiar al momento.
 
-Si ejecutaste `--install` desde otro directorio o un repositorio clonado, ya puedes borrar esa carpeta original porque el script queda guardado en `~/.config/fclean/fclean`.
+> [!NOTE]
+> Si ejecutaste `--install` desde otro directorio o un repositorio clonado, ya puedes borrar esa carpeta original porque el script queda guardado en `~/.config/fclean/fclean`.
 
 
 ## Uso sin instalar
 
-Para ejecutar la limpieza en cualquier momento, desde la carpeta del script puedes ejecutar:
-
-```bash
-bash fclean --clean
-```
-
-- Para añadir solo el alias:
+Para añadir solo el alias:
 
 ```bash
 bash ~/.config/fclean/fclean --alias
 ```
+
+Para ejecutar la limpieza en cualquier momento:
+
+```bash
+fclean --clean
+```
+
 
 Abre una nueva terminal Zsh para usar el alias desde cualquier carpeta.
 
