@@ -737,6 +737,107 @@ printf '%s' "$status"
         self.assertFalse(outside.exists())
 
     @unittest.skipUnless(shutil.which("zsh"), "requiere Zsh para probar el alias")
+    def test_alias_without_installation_survives_uninstall_and_is_removed_by_funinstall(self):
+        source = self.put("descarga con espacios, dólar $, comilla ' y barra \\/fclean", SCRIPT.read_text())
+        installed = self.put(".config/fclean/fclean", SCRIPT.read_text())
+        installed_time = installed.stat().st_mtime_ns
+        self.run_command("bash", source, "--alias")
+        zshrc = self.home / ".zshrc"
+        original = zshrc.read_text()
+        self.assertEqual(original.count("alias fclean="), 1)
+        self.assertNotIn("--prepare-env", original)
+        self.assertEqual(list(installed.parent.iterdir()), [installed])
+        self.assertEqual(installed.stat().st_mtime_ns, installed_time)
+        self.assertFalse((self.home / ".config/autostart").exists())
+        elsewhere = self.new_directory()
+        self.assertEqual(self.run_command("zsh", "-ic", "fclean --help", cwd=elsewhere).stdout,
+                         self.run_cli("--help").stdout)
+        self.run_command("zsh", "-ic", "fclean --alias", cwd=elsewhere)
+        self.assertEqual(zshrc.read_text(), original)
+        self.assertEqual(list(self.home.glob(".zshrc.antes-de-fclean.*")), [])
+        self.run_command("zsh", "-ic", "fclean --uninstall")
+        self.assertEqual(zshrc.read_text(), original)
+        self.assertIn("Uso:", self.run_command("zsh", "-ic", "fclean --help").stdout)
+        self.run_command("zsh", "-ic", "fclean --funinstall")
+        self.assertEqual(zshrc.read_text(), "")
+        self.assertFalse(installed.parent.exists())
+        self.assertEqual(source.read_text(), SCRIPT.read_text())
+        self.assertNotEqual(self.run_command("zsh", "-ic", "alias fclean", check=False).returncode, 0)
+
+    @unittest.skipUnless(shutil.which("zsh"), "requiere Zsh para probar ZDOTDIR y enlaces")
+    def test_alias_uses_custom_installation_location_and_preserves_linked_zshrc(self):
+        source = self.put("descarga/fclean", SCRIPT.read_text())
+        config = self.home / "config con espacios, dólar $, comilla ' y barra \\"
+        self.env["XDG_CONFIG_HOME"] = str(config)
+        installed = self.put("fclean/fclean", SCRIPT.read_text(), base=config)
+        link = self.home / "enlace-fclean"
+        link.symlink_to(source)
+        normal = self.put(".zshrc", "# predeterminada\n")
+        custom = self.put("dotfiles/zshrc", "export MI_VARIABLE=ejemplo\n")
+        dotdir = self.new_directory()
+        (dotdir / ".zshrc").symlink_to(custom)
+        self.env["ZDOTDIR"] = str(dotdir)
+        self.run_command("bash", link, "--alias")
+        link.unlink()
+        source.unlink()
+        self.assertTrue((dotdir / ".zshrc").is_symlink())
+        self.assertTrue(custom.read_text().startswith("export MI_VARIABLE=ejemplo\n"))
+        self.assertEqual(normal.read_text(), "# predeterminada\n")
+        self.assertEqual(len(list(custom.parent.glob("zshrc.antes-de-fclean.*"))), 1)
+        self.assertIn("Uso:", self.run_command("zsh", "-ic", "fclean --help").stdout)
+        self.assertEqual(installed.read_text(), SCRIPT.read_text())
+        self.assertFalse((config / "autostart").exists())
+        self.assertFalse((self.home / ".config/fclean").exists())
+
+    @unittest.skipUnless(shutil.which("zsh"), "requiere Zsh para probar la transición a instalación")
+    def test_alias_and_install_can_be_combined_without_duplicating_or_disabling_configuration(self):
+        source = self.put("descarga/fclean", SCRIPT.read_text())
+        installed = self.put(".config/fclean/fclean", SCRIPT.read_text())
+        self.run_command("bash", source, "--alias")
+        self.run_command("zsh", "-ic", "fclean --install")
+        zshrc = self.home / ".zshrc"
+        desktop = self.home / ".config/autostart/42-fclean.desktop"
+        installed_text, desktop_text = installed.read_bytes(), desktop.read_bytes()
+        original = zshrc.read_text()
+        self.run_command("zsh", "-ic", "fclean --alias")
+        self.assertEqual(zshrc.read_text(), original)
+        self.run_command("bash", source, "--alias")
+        self.assertEqual(zshrc.read_text().count("alias fclean="), 1)
+        self.assertEqual(zshrc.read_text(), original)
+        self.assertEqual(installed.read_bytes(), installed_text)
+        self.assertEqual(desktop.read_bytes(), desktop_text)
+        source.write_text(SCRIPT.read_text().replace("Uso: fclean", "Uso: copia local"))
+        self.assertIn("Uso: fclean", self.run_command("zsh", "-ic", "fclean --help").stdout)
+        self.run_command("zsh", "-ic", "fclean --uninstall")
+        self.assertIn("Uso: fclean", self.run_command("zsh", "-ic", "fclean --help").stdout)
+
+    def test_alias_only_edits_zsh_configuration_and_backs_up_user_content(self):
+        original = "export MI_VARIABLE=ejemplo\nalias fclean='echo personal'\n"
+        zshrc = self.put(".zshrc", original)
+        cached = self.put(".cache/conservar")
+        self.stub("python3", "exit 1")
+        self.stub("findmnt", "exit 1")
+        self.stub("curl", 'touch "$HOME/no-actualizar"; exit 1')
+        self.run_cli("--alias")
+        self.assertTrue(zshrc.read_text().startswith(original))
+        backups = list(self.home.glob(".zshrc.antes-de-fclean.*"))
+        self.assertEqual(len(backups), 1)
+        self.assertEqual(backups[0].read_text(), original)
+        self.assertTrue(cached.is_file())
+        self.assertFalse((self.home / ".config").exists())
+        self.assertFalse((self.home / "no-actualizar").exists())
+
+    def test_alias_refuses_incomplete_managed_blocks_without_modifying_them(self):
+        for marker in ("fclean: alias", "fclean: entorno sgoinfre", "42-SGOINFRE-SHIELD"):
+            with self.subTest(marker=marker):
+                broken = f"# >>> {marker} >>>\n"
+                zshrc = self.put(".zshrc", broken)
+                result = self.run_cli("--alias", check=False)
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertEqual(zshrc.read_text(), broken)
+                self.assertEqual(list(self.home.glob(".zshrc.fclean.*")), [])
+
+    @unittest.skipUnless(shutil.which("zsh"), "requiere Zsh para probar el alias")
     def test_install_alias_autostart_reinstall_and_uninstall(self):
         config = self.home / "config con espacios, dólar $, comilla ' y barra \\"
         self.env["XDG_CONFIG_HOME"] = str(config)
@@ -1117,7 +1218,7 @@ printf '%s' "$status"
         cached = self.put(".cache/visible")
         with (self.runtime / "42-fclean.lock").open("w") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            for option in ("--clean", "--fclean", "--migrate", "--migrate-cache", "--install", "--uninstall", "--funinstall"):
+            for option in ("--clean", "--fclean", "--migrate", "--migrate-cache", "--alias", "--install", "--uninstall", "--funinstall"):
                 with self.subTest(option=option):
                     result = self.run_cli(option, check=False)
                     self.assertEqual(result.returncode, 1, result.stdout + result.stderr)

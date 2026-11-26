@@ -14,6 +14,7 @@ Uso: fclean [opción] o bash fclean [opción]
   --fclean         Misma limpieza con borrado inmediato de venvs reconocidos.
   --migrate        Traslada las extensiones de VS Code a sgoinfre.
   --migrate-cache  Traslada ~/.cache a sgoinfre.
+  --alias          Añade solo el alias de Zsh a la copia de ~/.config/fclean.
   --install        Configura el alias en Zsh y la limpieza al iniciar sesión.
   --uninstall      Retira el inicio automático y la configuración de sgoinfre; conserva el alias.
   --funinstall     Retira toda la instalación, incluido el script y el seguimiento de venvs.
@@ -31,7 +32,7 @@ present() { [[ -e $1 || -L $1 ]]; }
 mode=${1:---help}
 case $mode in
     --help|-h) usage; exit 0 ;;
-    --dry-run|--clean|--fclean|--migrate|--migrate-cache|--install|--uninstall|--funinstall|--prepare-env) ;;
+    --dry-run|--clean|--fclean|--migrate|--migrate-cache|--alias|--install|--uninstall|--funinstall|--prepare-env) ;;
     *) usage >&2; exit 2 ;;
 esac
 
@@ -160,12 +161,18 @@ has_legacy_block() {
     grep -Fxq -e "$begin" -e "$end" -- "$1" || { [[ $? == 1 ]] && return 1; die "No se pudo leer $1"; }
 }
 
+write_zsh_alias() {
+    local command
+    printf -v command '/bin/bash %q' "$1"
+    printf 'alias fclean=%q\n' "$command"
+}
+
 write_zsh_block() {
     local installed_command
     printf -v installed_command '/bin/bash %q' "$installed"
-    if [[ $1 == uninstall ]]; then
+    if [[ $1 == alias ]]; then
         printf '%s\n' "$alias_begin"
-        printf 'alias fclean=%q\n' "$installed_command"
+        write_zsh_alias "$installed"
         printf '%s\n' "$alias_end"
         return
     fi
@@ -186,14 +193,14 @@ else
     if [[ ${SGO:-} == "$HOME/sgoinfre/${USER:-}" ]]; then unset SGO; fi
 fi
 ZSH
-    printf 'alias fclean=%q\n' "$installed_command"
+    write_zsh_alias "$installed"
     printf '%s\n' "$env_end"
 }
 
 update_zshrc() (
-    local action=$1 file=$2 input=/dev/null tmp backup block=''
+    local action=$1 file=$2 input=/dev/null tmp backup block='' alias_line
     [[ $file == /* ]] || die 'ZDOTDIR debe ser una ruta absoluta.'
-    if [[ $action != install && ! -e $file ]]; then return 0; fi
+    if [[ ( $action == uninstall || $action == funinstall ) && ! -e $file ]]; then return 0; fi
     if present "$file"; then
         [[ -f $file ]] || die "Ruta de configuración inesperada: $file"
         file=$(realpath -e -- "$file")
@@ -207,24 +214,41 @@ update_zshrc() (
     fi
     tmp=$(mktemp -- "${file}.fclean.XXXXXXXX")
     trap 'rm -f -- "$tmp"' EXIT
-    if [[ $action != funinstall ]]; then block=$(write_zsh_block "$action"); fi
-    FCLEAN_ZSH_BLOCK="$block" awk -v action="$action" -v old="$begin" -v oldEnd="$end" \
+    if [[ $action == install || $action == alias ]]; then block=$(write_zsh_block "$action"); fi
+    alias_line=$(write_zsh_alias "$installed")
+    FCLEAN_ZSH_BLOCK="$block" FCLEAN_ZSH_ALIAS="$alias_line" awk -v action="$action" -v old="$begin" -v oldEnd="$end" \
         -v new="$env_begin" -v newEnd="$env_end" -v aliasBegin="$alias_begin" -v aliasEnd="$alias_end" '
             $0 == new || $0 == aliasBegin || (action != "uninstall" && $0 == old) {
                 if (inside || seen[$0]++) exit 2
                 inside = ($0 == new ? newEnd : ($0 == aliasBegin ? aliasEnd : oldEnd))
-                if (action != "funinstall" && !written++) print ENVIRON["FCLEAN_ZSH_BLOCK"]
+                if (action == "alias" && inside != aliasEnd) print
+                else if ((action == "install" || action == "alias") && !written++) print ENVIRON["FCLEAN_ZSH_BLOCK"]
                 next
             }
             $0 == newEnd || $0 == aliasEnd || (action != "uninstall" && $0 == oldEnd) {
                 if (inside != $0) exit 2
+                if (action == "alias" && inside != aliasEnd) print
                 inside = ""
+                next
+            }
+            inside && action == "alias" && inside != aliasEnd {
+                if ($0 ~ /^alias fclean=/) {
+                    if (!written++) print ENVIRON["FCLEAN_ZSH_ALIAS"]
+                } else print
+                next
+            }
+            inside && action == "uninstall" && /^alias fclean=/ {
+                if (!written++) {
+                    print aliasBegin
+                    print
+                    print aliasEnd
+                }
                 next
             }
             !inside { print }
             END {
                 if (inside) exit 2
-                if (action == "install" && !written) print ENVIRON["FCLEAN_ZSH_BLOCK"]
+                if ((action == "install" || action == "alias") && !written) print ENVIRON["FCLEAN_ZSH_BLOCK"]
             }
         ' "$input" > "$tmp" || die "Marcadores incompletos o repetidos en $file"
     if [[ -f $file ]]; then
@@ -268,6 +292,10 @@ install_autostart() (
 )
 
 case $mode in
+    --alias)
+        update_zshrc alias "$zshrc"
+        printf 'Alias fclean configurado para %s. Abre una nueva terminal Zsh para usarlo.\n' "$installed"
+        exit 0 ;;
     --install) install_autostart; exit 0 ;;
     --uninstall)
         if present "$desktop"; then
