@@ -258,6 +258,10 @@ update_zshrc() (
             backup=$(mktemp -- "${file}.antes-de-fclean.XXXXXXXX")
             cp -p -- "$file" "$backup"
             printf 'Copia de la configuración: %s\n' "$backup"
+            local old
+            for old in "${file}.antes-de-fclean."*; do
+                [[ $old != "$backup" && -f $old && ! -L $old && -O $old ]] && rm -f -- "$old"
+            done
         fi
     fi
     mv -T -- "$tmp" "$file"
@@ -341,6 +345,8 @@ app_closed() {
 inspect_home_venvs() {
     python3 -IS - "${1:-$home}" "$mode" "${mounts[@]}" <<'PY'
 import collections
+import fcntl
+import hashlib
 import os
 import re
 import shutil
@@ -378,8 +384,11 @@ cutoff = time.time() - 5 * 24 * 60 * 60
 module = "_fclean_venv_usage_v1.py"
 startup = "fclean_venv_usage_v1.pth"
 running = ".fclean-running-"
+token_content = b"fclean-running-v2\n"
+legacy_hook_sha256 = "dae393ce8febaedee6a561dc8cf8f8a0b4af34ce24b7b0009c070971ae03dea2"
 hook = b'''# Seguimiento de uso de este venv por fclean.
 import atexit
+import fcntl
 import os
 import tempfile
 
@@ -391,7 +400,13 @@ def _record():
     with open("/proc/sys/kernel/random/boot_id", encoding="ascii") as stream:
         boot = stream.read().strip()
     fd, token = tempfile.mkstemp(prefix=f".fclean-running-{boot}.{pid}.", dir=site)
-    os.close(fd)
+    try:
+        fcntl.lockf(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        os.write(fd, b"fclean-running-v2\\n")
+    except OSError:
+        os.close(fd)
+        # Keep an empty legacy marker if locking is unavailable.
+        return
     def finished():
         if os.getpid() != pid:
             return
@@ -403,6 +418,7 @@ def _record():
             os.unlink(token)
         except OSError:
             pass
+        os.close(fd)
     atexit.register(finished)
 
 def _try_record():
@@ -472,6 +488,7 @@ def trusted_site(path, site):
 
 def tracking_files(site_fd, create, remove):
     missing = []
+    outdated = []
     for name, expected in managed.items():
         try:
             fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=site_fd)
@@ -480,9 +497,13 @@ def tracking_files(site_fd, create, remove):
             continue
         with os.fdopen(fd, "rb") as stream:
             info = os.fstat(fd)
+            content = stream.read(max(len(expected), 910) + 1)
+            legacy = name == module and hashlib.sha256(content).hexdigest() == legacy_hook_sha256
             if (not stat.S_ISREG(info.st_mode) or info.st_uid != uid or info.st_nlink != 1
-                    or info.st_mode & 0o022 or stream.read(len(expected) + 1) != expected):
+                    or info.st_mode & 0o022 or (content != expected and not legacy)):
                 raise ValueError(f"archivo de seguimiento ajeno o modificado: {name!r}")
+            if legacy:
+                outdated.append(name)
     if remove:
         # Desactiva el arranque antes de retirar el módulo, sin ejecutar el venv.
         for name in reversed(list(managed)):
@@ -491,7 +512,7 @@ def tracking_files(site_fd, create, remove):
         for name in os.listdir(site_fd):
             if re.fullmatch(re.escape(running) + r"[0-9a-f-]{36}\.[0-9]+\.[a-z0-9_]{8}", name):
                 info = os.stat(name, dir_fd=site_fd, follow_symlinks=False)
-                if stat.S_ISREG(info.st_mode) and info.st_uid == uid and info.st_size == 0:
+                if stat.S_ISREG(info.st_mode) and info.st_uid == uid and info.st_size in (0, len(token_content)):
                     os.unlink(name, dir_fd=site_fd)
         try:
             cache_fd = os.open("__pycache__", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=site_fd)
@@ -514,12 +535,24 @@ def tracking_files(site_fd, create, remove):
         if empty:
             os.rmdir("__pycache__", dir_fd=site_fd)
     elif create:
-        for name in missing:  # El módulo se instala antes que el archivo de arranque.
+        for name in outdated + missing:  # El módulo se instala antes que el archivo de arranque.
             with tempfile.NamedTemporaryFile(dir=f"/proc/self/fd/{site_fd}", prefix=".fclean-install-") as stream:
                 stream.write(managed[name])
                 stream.flush()
-                os.link(stream.name, name, dst_dir_fd=site_fd)
-    return not missing
+                if name in outdated:
+                    # Conserva el temporal para que su contexto pueda retirarlo.
+                    replacement = stream.name + ".upgrade"
+                    try:
+                        os.link(stream.name, replacement)
+                        os.replace(replacement, name, dst_dir_fd=site_fd)
+                    finally:
+                        if os.path.lexists(replacement):
+                            os.unlink(replacement)
+                else:
+                    os.link(stream.name, name, dst_dir_fd=site_fd)
+        if outdated:
+            os.utime(startup, dir_fd=site_fd, follow_symlinks=False)
+    return not missing and not outdated
 
 def check_tracking(site, create=False, remove=False):
     fd = os.open(site, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
@@ -537,11 +570,38 @@ def running_sessions(site):
     with open("/proc/sys/kernel/random/boot_id", encoding="ascii") as stream:
         prefix = running + stream.read().strip() + "."
     for name in tokens:
+        if not re.fullmatch(re.escape(running) + r"[0-9a-f-]{36}\.[0-9]+\.[a-z0-9_]{8}", name):
+            continue
+        path = os.path.join(site, name)
         pid = name[len(prefix):].split(".", 1)[0]
-        if mode == "--clean" and name.startswith(prefix) and pid.isdecimal() and not os.path.exists("/proc/" + pid):
-            # Un cierre abrupto en este puesto. Dar cinco días desde que se detecta.
-            os.utime(os.path.join(site, startup), follow_symlinks=False)
-            os.unlink(os.path.join(site, name))
+        try:
+            fd = os.open(path, os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK)
+        except FileNotFoundError:
+            continue
+        with os.fdopen(fd, "r+b") as stream:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != uid or info.st_nlink != 1:
+                continue
+            content = stream.read(len(token_content) + 1)
+            if content == token_content:
+                try:
+                    fcntl.lockf(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    continue  # Proceso vivo, aunque esté en otro equipo.
+                except OSError:
+                    continue  # No se puede verificar el bloqueo: conservar.
+            elif content == b"":
+                if not name.startswith(prefix) or not pid.isdecimal():
+                    print(f"Marcador antiguo de otra sesión: {path!r}. Revisa que su intérprete haya terminado antes de retirarlo.", file=sys.stderr)
+                    continue
+                if os.path.exists("/proc/" + pid):
+                    continue
+            else:
+                continue
+            if mode == "--clean" and os.path.samestat(info, os.lstat(path)):
+                # Cinco días nuevos de margen después de retirar un marcador huérfano.
+                os.utime(os.path.join(site, startup), follow_symlinks=False)
+                os.unlink(path)
     return True
 
 def active_locally(path, project):
@@ -595,14 +655,14 @@ def eligible_size(path, site, moved=False):
         for name in ([None] if base == path else []) + dirs + files:
             child = os.path.join(base, name) if name is not None else base
             info = os.lstat(child)
-            if info.st_uid != uid or info.st_dev != device or child in mounts or (name or "").startswith(".nfs"):
+            if info.st_uid != uid or info.st_dev != device or child in mounts or (name or "").startswith(".nfs") or name == ".fclean-keep":
                 return None
             if not force:
                 # El rename final cambia el ctime de la raíz aunque su contenido sea idéntico.
                 latest = info.st_mtime if moved and child == path else max(info.st_mtime, info.st_ctime)
                 if stat.S_ISREG(info.st_mode) and child not in metadata:
                     latest = max(latest, info.st_atime)
-                if latest > cutoff or (name or "").startswith(running) or name == ".fclean-keep":
+                if latest > cutoff or (name or "").startswith(running):
                     return None
             if not (stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode)):
                 return None
@@ -626,13 +686,24 @@ def contains_mount(path):
                 return True
     return False
 
+def keep_in_ancestors(path):
+    parent = os.path.dirname(path)
+    while parent != home and parent != os.path.dirname(parent):
+        try:
+            os.lstat(os.path.join(parent, ".fclean-keep"))
+            return True
+        except FileNotFoundError:
+            pass
+        parent = os.path.dirname(parent)
+    return False
+
 def inactive_project(path, site):
     project = project_for(path)
     if not project:
         if mode == "--dry-run":
             print(f"Venv conservado sin proyecto identificable: {path!r}", file=sys.stderr)
         return
-    if any(os.path.lexists(os.path.join(p, ".fclean-keep")) for p in (path, project)):
+    if os.path.lexists(os.path.join(path, ".fclean-keep")) or keep_in_ancestors(path):
         return
     if not check_tracking(site, mode == "--clean"):
         action = "Seguimiento iniciado" if mode == "--clean" else "Se iniciaría el seguimiento"
@@ -656,6 +727,8 @@ def process_venv(path, site, identity):
     if removing_tracking:
         check_tracking(site, remove=True)
         return
+    if force and keep_in_ancestors(path):
+        return
     project = None if force else inactive_project(path, site)
     if not force and not project:
         return
@@ -672,7 +745,7 @@ def process_venv(path, site, identity):
             moved_site = os.path.join(moved, os.path.relpath(site, path))
             if (not os.path.samestat(identity, os.lstat(moved)) or contains_mount(moved) or
                     not trusted_site(moved, moved_site) or not set(os.listdir(moved)) <= venv_entries or
-                    eligible_size(moved, moved_site, moved=True) is None):
+                    eligible_size(moved, moved_site, moved=True) is None or keep_in_ancestors(path)):
                 raise ValueError("el entorno cambió durante la limpieza")
             if not force and (not project_quiet(project, path, staging) or not check_tracking(moved_site) or
                     os.stat(os.path.join(moved_site, startup)).st_mtime > cutoff):
@@ -852,13 +925,33 @@ def mount_id(fd):
     with open(f"/proc/self/fdinfo/{fd}", encoding="ascii") as info:
         return next(line for line in info if line.startswith("mnt_id:"))
 
+def venv_has_keep(fd, mount):
+    names = os.listdir(fd)
+    if ".fclean-keep" in names:
+        return True
+    for name in names:
+        try:
+            entry = os.stat(name, dir_fd=fd, follow_symlinks=False)
+            if stat.S_ISDIR(entry.st_mode):
+                child = os.open(name, flags, dir_fd=fd)
+                try:
+                    if os.path.samestat(entry, os.fstat(child)) and mount_id(child) == mount:
+                        if venv_has_keep(child, mount):
+                            return True
+                finally:
+                    os.close(child)
+        except FileNotFoundError:
+            continue
+    return False
+
 def clean(fd, relative, mount, apply):
     global files, blocks, directories
     if obsolete_extensions and not os.access(".", os.W_OK | os.X_OK, dir_fd=fd):
         return False
     names = os.listdir(fd)
-    if "pyvenv.cfg" in names and not (in_trash or obsolete_extensions or remove_cached_venvs):
-        return False
+    if "pyvenv.cfg" in names and not (in_trash or obsolete_extensions):
+        if not remove_cached_venvs or venv_has_keep(fd, mount):
+            return False
     if guarded and (markers.intersection(names) or {"HEAD", "objects", "refs"}.issubset(names)):
         return False
     empty = True

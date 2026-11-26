@@ -130,10 +130,8 @@ class VenvCleanupTests(unittest.TestCase):
         self.assertFalse(self.stamp.exists())
         self.assertTrue(self.python.exists())
 
-    def test_fclean_removes_recent_active_and_protected_venv(self):
+    def test_fclean_removes_recent_and_active_venv(self):
         self.inspect("--clean")
-        (self.project / ".fclean-keep").touch()
-        (self.env / ".fclean-keep").touch()
         (self.site / "fuente-externa").symlink_to(self.source)
         code = "import sys; print('ready', flush=True); sys.stdin.readline()"
         with subprocess.Popen([self.python, "-I", "-c", code], stdin=subprocess.PIPE,
@@ -142,7 +140,40 @@ class VenvCleanupTests(unittest.TestCase):
             self.assertIn(str(self.env), self.inspect("--fclean").stdout)
         self.assertFalse(self.env.exists())
         self.assertEqual(self.source.read_text(), "print(42)\n")
-        self.assertTrue((self.project / ".fclean-keep").exists())
+
+    def test_fclean_obeys_keep_in_venv_project_and_ancestors(self):
+        self.inspect("--clean")
+        for location in (self.env / ".fclean-keep", self.site / ".fclean-keep", self.project / ".fclean-keep"):
+            with self.subTest(location=location):
+                location.touch()
+                self.assertEqual(self.inspect("--fclean").stdout, "")
+                self.assertTrue(self.python.exists())
+                self.assertTrue(self.stamp.exists())
+                location.unlink()
+        self.source.unlink()
+        keep = self.project / ".fclean-keep"
+        keep.touch()
+        self.assertEqual(self.inspect("--fclean").stdout, "")
+        self.assertTrue(self.python.exists())
+        keep.unlink()
+        home_keep = self.home / ".fclean-keep"
+        home_keep.touch()
+        self.assertIn(str(self.env), self.inspect("--fclean").stdout)
+        self.assertFalse(self.env.exists())
+        self.assertTrue(home_keep.exists())
+
+    def test_fclean_obeys_keep_in_parent_group_above_project(self):
+        grouped = self.home / "grupo/subproyecto/entorno"
+        subprocess.run([sys.executable, "-I", "-m", "venv", "--without-pip", grouped], check=True)
+        keep = self.home / "grupo/.fclean-keep"
+        keep.touch()
+        output = self.inspect("--fclean").stdout
+        self.assertNotIn(str(grouped), output)
+        self.assertIn(str(self.env), output)
+        self.assertTrue((grouped / "bin/python").exists())
+        keep.unlink()
+        self.assertIn(str(grouped), self.inspect("--fclean").stdout)
+        self.assertFalse(grouped.exists())
 
     def test_fclean_without_project_or_tracking(self):
         self.source.unlink()

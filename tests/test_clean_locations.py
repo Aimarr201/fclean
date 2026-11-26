@@ -467,17 +467,26 @@ printf '%s' "$status"
         personal = self.mount_sgoinfre()
         local = self.home / ".cache/.entorno"
         moved = personal / ".cache/.entorno"
-        for venv in (local, moved):
-            venv.parent.mkdir()
+        kept = self.home / ".cache/conservado"
+        kept_remote = personal / ".cache/sub/conservado"
+        for venv in (local, moved, kept, kept_remote):
+            venv.parent.mkdir(parents=True, exist_ok=True)
             self.run_command(sys.executable, "-I", "-m", "venv", "--without-pip", venv)
-            (venv.parent / ".temporal").touch()
+        (local.parent / ".temporal").touch()
+        (moved.parent / ".temporal").touch()
+        (kept / ".fclean-keep").touch()
+        (kept_remote / "lib/.fclean-keep").touch()
         self.run_cli("--clean")
-        for venv in (local, moved):
+        for venv in (local, moved, kept, kept_remote):
             self.assertTrue((venv / "pyvenv.cfg").is_file())
             self.assertFalse((venv.parent / ".temporal").exists())
         self.run_cli("--fclean")
         self.assertFalse(local.exists())
         self.assertFalse(moved.exists())
+        self.assertTrue((kept / "pyvenv.cfg").is_file())
+        self.assertTrue((kept / ".fclean-keep").is_file())
+        self.assertTrue((kept_remote / "pyvenv.cfg").is_file())
+        self.assertTrue((kept_remote / "lib/.fclean-keep").is_file())
 
     def test_cache_migration_copies_links_and_can_be_repeated(self):
         personal = self.mount_sgoinfre()
@@ -912,6 +921,22 @@ printf '%s' "$status"
         self.run_cli("--uninstall")
         self.assertEqual(zshrc.read_text(), original)
         self.assertEqual(list(self.home.glob(".zshrc.antes-de-fclean.*")), [])
+
+    def test_zshrc_backup_rotation_keeps_only_the_latest_copy(self):
+        zshrc = self.put(".zshrc", "# original\n")
+        self.run_cli("--install")
+        backups = list(self.home.glob(".zshrc.antes-de-fclean.*"))
+        self.assertEqual(len(backups), 1)
+        self.assertEqual(backups[0].read_text(), "# original\n")
+        self.run_cli("--uninstall")
+        new_backups = list(self.home.glob(".zshrc.antes-de-fclean.*"))
+        self.assertEqual(len(new_backups), 1)
+        self.assertNotEqual(new_backups, backups)
+        self.assertFalse(backups[0].exists())
+        self.run_cli("--install")
+        self.assertEqual(len(list(self.home.glob(".zshrc.antes-de-fclean.*"))), 1)
+        self.run_cli("--install")
+        self.assertEqual(len(list(self.home.glob(".zshrc.antes-de-fclean.*"))), 1)
 
     @unittest.skipUnless(shutil.which("zsh"), "requiere Zsh para comprobar el entorno de arranque")
     def test_zsh_uses_verified_mount_and_discards_stale_exports(self):
