@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 # fclean para las sesiones de usuario de Ubuntu del campus 42.
 # fclean: actualizaciones v1
-# Al usar «source ./fclean --alias», la recarga pertenece a la Zsh que llamó al script.
+# Con source, la Zsh que inició la instalación recarga su configuración al terminar.
 if [ -n "${ZSH_VERSION:-}" ] && [ -z "${BASH_VERSION:-}" ]; then
     if [[ $ZSH_EVAL_CONTEXT == *:file ]]; then
-        if [[ $# != 1 || $1 != --alias ]]; then
-            printf '%s\n' 'Usa source ./fclean --alias para configurar esta sesión.' >&2
+        if [[ $# != 1 || ( $1 != --alias && $1 != --install ) ]]; then
+            printf '%s\n' 'Usa source ./fclean --install o source ./fclean --alias para configurar esta sesión.' >&2
             return 2
         fi
-        FCLEAN_RELOAD_ZSH=1 /bin/bash -- "${(%):-%x}" --alias || return $?
+        FCLEAN_RELOAD_ZSH=1 /bin/bash -- "${(%):-%x}" "$1" || return $?
         # El directorio actual puede haber sido el clon recién retirado.
         if [[ ! -d $PWD ]]; then builtin cd -q -- "$HOME" || return $?; fi
         set --

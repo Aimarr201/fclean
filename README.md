@@ -13,11 +13,10 @@ wget -P ~/.config/fclean https://raw.githubusercontent.com/Aimarr201/fclean/main
 
 ## Instalación recomendada
 
-Para el uso habitual, se recomienda usar `--install`. Esto añade el alias `fclean` a la terminal y activa `--clean` cada inicio de sesión.
+Para el uso habitual, se recomienda usar `--install`. Esto añade el alias `fclean` a la terminal actual y activa `--clean` cada inicio de sesión.
 
-
-```bash
-bash ~/.config/fclean/fclean --install
+```zsh
+source ~/.config/fclean/fclean --install
 ```
 
 

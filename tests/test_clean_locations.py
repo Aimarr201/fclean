@@ -882,6 +882,19 @@ printf '%s' "$status"
         self.assertEqual((self.home / ".config/fclean/fclean").read_bytes(), SCRIPT.read_bytes())
         self.assertFalse((self.home / ".zshrc").exists())
 
+    @unittest.skipUnless(shutil.which("zsh"), "requiere Zsh para recargar la sesión")
+    def test_sourced_install_enables_autostart_and_loads_alias_in_current_zsh(self):
+        self.put(".config/fclean/fclean", SCRIPT.read_text())
+        config = self.put("dotfiles/.zshrc", "[[ $# == 0 ]] || return 1\n(( ++recargas ))\n")
+        self.env["ZDOTDIR"] = str(config.parent)
+        result = self.run_command("zsh", "-fc", """
+            source ~/.config/fclean/fclean --install || exit 1
+            [[ $recargas == 1 && $1 == exterior ]] || exit 2
+            eval 'fclean --help'
+        """, "zsh", "exterior")
+        self.assertIn("Uso: fclean", result.stdout)
+        self.assertTrue((self.home / ".config/autostart/42-fclean.desktop").is_file())
+
     def test_alias_preserves_other_repositories_and_local_work(self):
         cases = ("otro origen", "modificado", "ignorado", "sin seguimiento", "commit local",
                  "rama local", "stash", "worktree", "etiqueta local", "origen cambiado")
