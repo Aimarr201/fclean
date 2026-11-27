@@ -23,11 +23,14 @@ shopt -s nullglob
 
 usage() {
     cat <<'HELP'
-Uso: fclean [opción] o bash fclean [opción]
+Uso: fclean [opción [ruta]] o bash fclean [opción [ruta]]
 
   --dry-run        Muestra qué se limpiaría y qué puede migrarse.
   --clean          Comprueba actualizaciones y limpia. Venvs tras 5 días de inactividad.
-  --fclean         Misma limpieza con borrado inmediato de venvs reconocidos.
+  --fclean         Borra los venvs reconocidos y pregunta por cada venv protegido.
+  --keep [ruta]    Protege los venvs del proyecto indicado o del proyecto actual.
+  --unkeep [ruta]  Retira la protección registrada del proyecto.
+  --kept-list      Muestra los proyectos protegidos, incluso si se han movido.
   --migrate        Traslada las extensiones de VS Code a sgoinfre.
   --migrate-cache  Traslada ~/.cache a sgoinfre.
   --alias          Instala el script y el alias de Zsh, y retira la descarga original.
@@ -36,7 +39,7 @@ Uso: fclean [opción] o bash fclean [opción]
   --funinstall     Retira toda la instalación, incluido el script y el seguimiento de venvs.
   -h, --help       Muestra esta ayuda, también disponible sin opciones.
 
-La limpieza borra datos sin confirmación. Cierra las aplicaciones antes de migrar.
+Los datos sin protección se limpian sin confirmación. Cierra las aplicaciones antes de migrar.
 HELP
 }
 
@@ -44,11 +47,14 @@ die() { printf 'Error: %s\n' "$*" >&2; exit 1; }
 notice() { printf '%s\n' "$*" >&2; }
 present() { [[ -e $1 || -L $1 ]]; }
 
-(( $# <= 1 )) || { usage >&2; exit 2; }
 mode=${1:---help}
 case $mode in
+    --keep|--unkeep) (( $# <= 2 )) && [[ $# == 1 || -n $2 ]] || { usage >&2; exit 2; } ;;
+    *) (( $# <= 1 )) || { usage >&2; exit 2; } ;;
+esac
+case $mode in
     --help|-h) usage; exit 0 ;;
-    --dry-run|--clean|--fclean|--migrate|--migrate-cache|--alias|--install|--uninstall|--funinstall|--prepare-env) ;;
+    --dry-run|--clean|--fclean|--keep|--unkeep|--kept-list|--migrate|--migrate-cache|--alias|--install|--uninstall|--funinstall|--prepare-env) ;;
     *) usage >&2; exit 2 ;;
 esac
 
@@ -75,7 +81,7 @@ alias_end='# <<< fclean: alias <<<'
 
 # El bloqueo local también funciona cuando la cuota del home está agotada.
 resumed_clean=false
-if [[ $mode != --dry-run && $mode != --prepare-env ]]; then
+if [[ $mode != --dry-run && $mode != --prepare-env && $mode != --kept-list ]]; then
     runtime=${XDG_RUNTIME_DIR:-/run/user/$UID}
     [[ -d $runtime && -O $runtime && ! -L $runtime ]] || die 'No se encuentra el directorio de ejecución de la sesión.'
     lock="$runtime/42-fclean.lock"
@@ -510,43 +516,187 @@ app_closed() {
     fi
 }
 
-# Examina los archivos como datos, sin ejecutar el intérprete del entorno.
-inspect_home_venvs() {
-    python3 -IS - "${1:-$home}" "$mode" "${mounts[@]}" <<'PY'
-import collections
+# La CLI y los dos recorridos de limpieza consultan el mismo registro de proyectos.
+venv_policy=$(cat <<'PY'
 import fcntl
-import functools
-import hashlib
 import json
 import os
-import re
-import shutil
 import stat
-import subprocess
 import sys
 import tempfile
+from pathlib import Path
+
+user_home = Path.home().resolve()
+registry = Path(os.environ.get("XDG_CONFIG_HOME") or user_home / ".config") / "fclean/protected-projects.json"
+
+def read_projects():
+    try:
+        if registry.parent.is_symlink():
+            raise ValueError("la carpeta de configuración es un enlace")
+        try:
+            fd = os.open(registry, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        except FileNotFoundError:
+            return set()
+        with os.fdopen(fd, encoding="utf-8") as stream:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+                raise ValueError("se esperaba un archivo propio")
+            entries = json.load(stream)
+        if not isinstance(entries, list) or any(
+                not isinstance(p, str) or not os.path.isabs(p) or os.path.normpath(p) != p
+                or "\0" in p or Path(p) in (user_home, *user_home.parents) for p in entries):
+            raise ValueError("se esperaba una lista de rutas absolutas de proyectos")
+        return set(entries)
+    except (ValueError, OSError) as exc:
+        raise SystemExit(f"No se puede leer el registro {str(registry)!r}: {exc}")
+
+def project_root(directory, *, search_python_parents):
+    start = Path(directory)
+    manifest = loose_python = None
+    for candidate in (start, *start.parents):
+        if candidate == user_home or candidate in user_home.parents:
+            break
+        git = candidate / ".git"
+        if (git / "HEAD").is_file() or git.is_file():
+            return str(candidate)
+        if manifest is None and any((candidate / name).is_file() for name in
+                ("pyproject.toml", "requirements.txt", "Pipfile", "setup.py", "setup.cfg")):
+            manifest = str(candidate)
+        if not manifest and not loose_python and (search_python_parents or candidate == start):
+            if any(p.suffix == ".py" and p.is_file() for p in candidate.iterdir()):
+                loose_python = str(candidate)
+    return manifest or loose_python
+
+def protection_reason(path, projects):
+    directory = Path(path)
+    for parent in (directory, *directory.parents):
+        if parent == user_home or parent in user_home.parents:
+            break
+        if str(parent) in projects:
+            return f"proyecto registrado {str(parent)!r}"
+    return None
+
+def confirm_venv(path, reason):
+    # Otros recorridos leerán las siguientes respuestas del mismo descriptor.
+    with os.fdopen(os.dup(0), "rb", buffering=0) as answers:
+        while True:
+            print(f"¿Borrar el venv protegido {path!r} ({reason})? [y/N] ", end="", file=sys.stderr, flush=True)
+            choice = answers.readline().strip().lower()
+            if not answers.isatty():
+                print(file=sys.stderr)
+            if choice == b"y":
+                return True
+            if choice in (b"", b"n"):
+                return False
+            print("Responde y o n.", file=sys.stderr)
+PY
+)
+
+venv_python() {
+    local body
+    body=$(cat) || return 1
+    python3 -IS -c "$venv_policy"$'\n'"$body" "$@" <&"${venv_input:-0}"
+}
+
+case $mode in
+    --keep|--unkeep|--kept-list)
+        venv_python "$mode" "${2:-.}" <<'PY'
+mode, target = sys.argv[1:]
+try:
+    if mode == "--kept-list":
+        projects = read_projects()
+        if not projects:
+            print("No hay proyectos protegidos.")
+        for project in sorted(projects):
+            suffix = "" if os.path.isdir(project) else " (ruta ausente)"
+            print(f"{project!r}{suffix}")
+        sys.exit(0)
+
+    # Permite retirar una ruta registrada aunque el proyecto ya no exista.
+    path = Path(target).resolve()
+    stored = read_projects()
+    if mode == "--unkeep" and os.path.abspath(target) in stored:
+        project = os.path.abspath(target)
+    elif mode == "--unkeep" and str(path) in stored:
+        project = str(path)
+    else:
+        if not path.is_dir() or not (project := project_root(path, search_python_parents=True)):
+            raise ValueError(f"no se ha encontrado un proyecto Git o Python en {str(path)!r}")
+    if registry.parent.is_symlink():
+        raise ValueError("la carpeta de configuración es un enlace")
+    registry.parent.mkdir(parents=True, exist_ok=True)
+    # El home puede ser compartido entre puestos con distintos XDG_RUNTIME_DIR.
+    fd = os.open(registry.with_suffix(".lock"), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+    with os.fdopen(fd, "rb+") as lock:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+            raise ValueError("bloqueo del registro inesperado")
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        projects = read_projects()
+        if mode == "--keep":
+            updated = projects | {project}
+        else:
+            updated = projects - {project}
+        if updated != projects:
+            with tempfile.NamedTemporaryFile(mode="w", dir=registry.parent, prefix=".protected-projects.",
+                                             encoding="utf-8", delete=False) as tmp:
+                try:
+                    json.dump(sorted(updated), tmp, indent=2)
+                    tmp.write("\n")
+                    tmp.flush()
+                    os.fsync(tmp.fileno())
+                    os.replace(tmp.name, registry)
+                finally:
+                    Path(tmp.name).unlink(missing_ok=True)
+        action = "Proyecto protegido" if mode == "--keep" else "Proyecto sin protección en el registro"
+        print(f"{action}: {project!r}")
+except (OSError, ValueError, RuntimeError) as exc:
+    sys.exit(f"No se pudo modificar la protección: {exc}")
+PY
+        exit 0 ;;
+esac
+
+# Examina los archivos como datos, sin ejecutar el intérprete del entorno.
+inspect_home_venvs() {
+    venv_python "${1:-$home}" "$mode" "${sgo_root:-}" "${mounts[@]}" <<'PY'
+import collections
+import functools
+import hashlib
+import re
+import shutil
+import subprocess
 import time
 
-home, mode = sys.argv[1:3]
+home, mode, sgo_root = sys.argv[1:4]
 force = mode == "--fclean"
 removing_tracking = mode == "--funinstall"
 scan_failed = False
-mounts = set(sys.argv[3:])
+mounts = set(sys.argv[4:])
 uid = os.getuid()
 device = os.stat(home).st_dev
 pruned = mounts | {os.path.join(home, "sgoinfre"), os.path.join(home, "goinfre")}
+projects = set() if removing_tracking else read_projects()
+managed_caches = {os.path.join(home, ".cache")}
+if sgo_root:
+    managed_caches.add(os.path.join(sgo_root, ".cache"))
+if not removing_tracking:
+    pruned.update(managed_caches)
 if force:
     # Algunas extensiones distribuyen su propio intérprete y paquetes Python.
-    pruned.update(os.path.join(home, editor, "extensions") for editor in (
+    managed_caches.update(os.path.join(home, editor, "extensions") for editor in (
         ".vscode", ".vscode-insiders", ".vscode-oss", ".vscode-server", ".vscode-server-insiders",
     ))
+    if sgo_root:
+        managed_caches.add(os.path.join(sgo_root, ".vscode/extensions"))
     if os.environ.get("VSCODE_EXTENSIONS"):
-        pruned.add(os.path.realpath(os.environ["VSCODE_EXTENSIONS"]))
+        managed_caches.add(os.path.realpath(os.environ["VSCODE_EXTENSIONS"]))
+    pruned.update(managed_caches)
 if not force and not removing_tracking:
     pruned.update(os.path.join(home, path) for path in (
-        ".cache", ".local/share/Trash", ".npm/_cacache", ".bun/install/cache",
+        ".local/share/Trash", ".npm/_cacache", ".bun/install/cache",
         ".local/share/pypoetry/venv", ".local/share/pipx", ".local/pipx", ".local/share/uv/tools",
     ))
+# Se admite el nombre de los metadatos antiguos para seguir reconociendo esos venvs.
 venv_entries = {"bin", "include", "lib", "lib64", "share", "etc", "pyvenv.cfg",
                 ".gitignore", ".Python", "CACHEDIR.TAG", ".fclean-keep"}
 if force:
@@ -669,19 +819,6 @@ def venv_site(path, entries):
 
 def raise_scan_error(exc):
     raise exc
-
-def project_for(path):
-    parent = os.path.dirname(path)
-    nearest = None
-    while parent != home:
-        if os.path.lexists(os.path.join(parent, ".git")):
-            return parent
-        if nearest is None and (any(os.path.isfile(os.path.join(parent, name)) for name in
-                ("pyproject.toml", "requirements.txt", "Pipfile", "setup.py", "setup.cfg"))
-                or (parent == os.path.dirname(path) and any(n.endswith(".py") for n in os.listdir(parent)))):
-            nearest = parent
-        parent = os.path.dirname(parent)
-    return nearest
 
 def trusted_site(path, site):
     current = site
@@ -885,7 +1022,7 @@ def project_quiet(project, env, staging=None):
             last = max(info.st_mtime, info.st_ctime)
             if stat.S_ISREG(info.st_mode) and name not in {"pyvenv.cfg", module, startup}:
                 last = max(last, info.st_atime)
-            if item in mounts or info.st_dev != device or name == ".fclean-keep" or last > cutoff:
+            if item in mounts or info.st_dev != device or last > cutoff:
                 return False
     return True
 
@@ -894,13 +1031,14 @@ def eligible_size(path, site, moved=False):
     metadata = {os.path.join(path, "pyvenv.cfg"), *(os.path.join(site, n) for n in managed)}
     links = collections.Counter()
     blocks = 0
+    env_device = os.lstat(path).st_dev
     for base, dirs, files in os.walk(path, onerror=raise_scan_error, followlinks=False):
         if base != path and {".git", ".hg", ".svn", "conda-meta", "pyvenv.cfg"}.intersection(dirs + files):
             return None
         for name in ([None] if base == path else []) + dirs + files:
             child = os.path.join(base, name) if name is not None else base
             info = os.lstat(child)
-            if info.st_uid != uid or info.st_dev != device or child in mounts or (name or "").startswith(".nfs") or name == ".fclean-keep":
+            if info.st_uid != uid or info.st_dev != env_device or child in mounts or (name or "").startswith(".nfs"):
                 return None
             if not force:
                 # El rename final cambia el ctime de la raíz aunque su contenido sea idéntico.
@@ -931,24 +1069,11 @@ def contains_mount(path):
                 return True
     return False
 
-def keep_in_ancestors(path):
-    parent = os.path.dirname(path)
-    while parent != home and parent != os.path.dirname(parent):
-        try:
-            os.lstat(os.path.join(parent, ".fclean-keep"))
-            return True
-        except FileNotFoundError:
-            pass
-        parent = os.path.dirname(parent)
-    return False
-
 def inactive_project(path, site):
-    project = project_for(path)
+    project = project_root(os.path.dirname(path), search_python_parents=False)
     if not project:
         if mode == "--dry-run":
             print(f"Venv conservado sin proyecto identificable: {path!r}", file=sys.stderr)
-        return
-    if os.path.lexists(os.path.join(path, ".fclean-keep")) or keep_in_ancestors(path):
         return
     if not check_tracking(site, mode == "--clean"):
         action = "Seguimiento iniciado" if mode == "--clean" else "Se iniciaría el seguimiento"
@@ -972,13 +1097,21 @@ def process_venv(path, site, identity):
     if removing_tracking:
         check_tracking(site, remove=True)
         return
-    if force and keep_in_ancestors(path):
+    if not os.path.samestat(identity, os.lstat(path)):
+        return
+    reason = protection_reason(path, projects)
+    if reason and not force:
+        if mode == "--dry-run":
+            print(f"Venv protegido {path!r}: {reason}.", file=sys.stderr)
         return
     project = None if force else inactive_project(path, site)
     if not force and not project:
         return
     size = eligible_size(path, site)
     if size is None:
+        return
+    confirmed = bool(reason and force and confirm_venv(path, reason))
+    if reason and not confirmed:
         return
     if mode in ("--clean", "--fclean"):
         # Apartar el directorio permite verificar su identidad antes del borrado.
@@ -990,7 +1123,8 @@ def process_venv(path, site, identity):
             moved_site = os.path.join(moved, os.path.relpath(site, path))
             if (not os.path.samestat(identity, os.lstat(moved)) or contains_mount(moved) or
                     not trusted_site(moved, moved_site) or not set(os.listdir(moved)) <= venv_entries or
-                    eligible_size(moved, moved_site, moved=True) is None or keep_in_ancestors(path)):
+                    eligible_size(moved, moved_site, moved=True) is None or
+                    (not confirmed and protection_reason(path, read_projects()))):
                 raise ValueError("el entorno cambió durante la limpieza")
             if not force and (not project_quiet(project, path, staging) or not check_tracking(moved_site) or
                     os.stat(os.path.join(moved_site, startup)).st_mtime > cutoff):
@@ -1011,10 +1145,30 @@ def scan_error(exc):
     scan_failed = True
     print(f"Se omite la búsqueda de venvs en {exc.filename!r}: {exc.strerror}", file=sys.stderr)
 
-for path, dirs, files in os.walk(home, onerror=scan_error, followlinks=False):
+def project_directories():
+    visited = set()
+    roots = [home]
+    if force or mode == "--dry-run":
+        roots.extend(sorted(projects))
+    for root in roots:
+        if root in visited or not os.path.isdir(root) or os.path.realpath(root) != root:
+            continue
+        if root != home and any(root == cache or root.startswith(cache + "/") for cache in managed_caches):
+            continue  # Estas rutas ya tienen sus propias reglas de limpieza.
+        try:
+            root_device = os.stat(root).st_dev
+        except OSError as exc:
+            scan_error(exc)
+            continue
+        for path, dirs, files in os.walk(root, onerror=scan_error, followlinks=False):
+            if path in projects:
+                visited.add(path)
+            yield path, dirs, files, root_device
+
+for path, dirs, files, root_device in project_directories():
     try:
         entry = os.lstat(path)
-        if not stat.S_ISDIR(entry.st_mode) or entry.st_dev != device or entry.st_uid != uid:
+        if not stat.S_ISDIR(entry.st_mode) or entry.st_dev != root_device or entry.st_uid != uid:
             dirs.clear()
             continue
         if force and os.path.basename(os.path.dirname(path)) == "extensions" and "package.json" in files:
@@ -1086,8 +1240,9 @@ def check_directory(path, *, installation=False):
             if re.fullmatch(r"\.fclean-update\.[A-Za-z0-9]{8}", name):
                 check_directory(child)
                 continue
-            known = name in {"fclean", "fclean.etag", "fclean.update.lock"} or re.fullmatch(
-                r"\.instalacion\.[A-Za-z0-9]{8}", name)
+            known = name in {"fclean", "fclean.etag", "fclean.update.lock",
+                             "protected-projects.json", "protected-projects.lock"} or re.fullmatch(
+                r"\.instalacion\.[A-Za-z0-9]{8}|\.protected-projects\.[a-z0-9_]{8}", name)
         else:
             known = name in {"script", "request", "etag", "state"}
         if not known or not stat.S_ISREG(entry.st_mode):
@@ -1147,12 +1302,8 @@ PY
 # Vacía el contenido desde el directorio ya validado. Las operaciones relativas
 # al descriptor evitan seguir un enlace si una entrada cambia durante el recorrido.
 clean_contents() {
-    python3 -IS - "$mode" "$@" <<'PY'
+    venv_python "$mode" "$@" <<'PY'
 import errno
-import json
-import os
-import stat
-import sys
 
 apply = sys.argv[1] in ("--clean", "--fclean")
 root = sys.argv[2]
@@ -1169,41 +1320,54 @@ markers = {".git", ".hg", ".svn", "pyvenv.cfg", "conda-meta"}
 uid = os.getuid()
 files = blocks = directories = 0
 remaining_links = {}
+projects = read_projects()
+decisions = {}
+removable_venvs = {}
+registry_dir = registry.parent.stat() if registry.exists() else None
 
 def mount_id(fd):
     with open(f"/proc/self/fdinfo/{fd}", encoding="ascii") as info:
         return next(line for line in info if line.startswith("mnt_id:"))
 
-def venv_has_keep(fd, mount):
-    names = os.listdir(fd)
-    if ".fclean-keep" in names:
-        return True
-    for name in names:
-        try:
-            entry = os.stat(name, dir_fd=fd, follow_symlinks=False)
-            if stat.S_ISDIR(entry.st_mode):
-                child = os.open(name, flags, dir_fd=fd)
-                try:
-                    if os.path.samestat(entry, os.fstat(child)) and mount_id(child) == mount:
-                        if venv_has_keep(child, mount):
-                            return True
-                finally:
-                    os.close(child)
-        except FileNotFoundError:
-            continue
-    return False
-
-def clean(fd, relative, mount, apply):
+def clean(fd, relative, mount, apply, selected=None):
     global files, blocks, directories
+    confirmed_identity = None
+    if registry_dir and os.path.samestat(registry_dir, os.fstat(fd)):
+        return False
     if obsolete_extensions and not os.access(".", os.W_OK | os.X_OK, dir_fd=fd):
         return False
     names = os.listdir(fd)
-    if "pyvenv.cfg" in names and not (in_trash or obsolete_extensions):
-        if not remove_cached_venvs or venv_has_keep(fd, mount):
+    if selected is not None:
+        # Una extensión que debe conservarse solo permite retirar los venvs confirmados.
+        location = os.readlink(f"/proc/self/fd/{fd}")
+        if location in selected:
+            info = os.fstat(fd)
+            if (info.st_dev, info.st_ino) != selected[location] or "pyvenv.cfg" not in names:
+                return False
+            selected = None
+        elif not any(p.startswith(location + "/") for p in selected):
+            return False
+    if "pyvenv.cfg" in names:
+        path = os.readlink(f"/proc/self/fd/{fd}")
+        reason = protection_reason(path, read_projects() if apply else projects)
+        if reason:
+            if not remove_cached_venvs:
+                if sys.argv[1] == "--dry-run":
+                    print(f"Venv protegido {path!r}: {reason}.", file=sys.stderr)
+                return False
+            # Las extensiones obsoletas se comprueban antes de vaciarse.
+            info = os.fstat(fd)
+            key = (path, info.st_dev, info.st_ino)
+            if key not in decisions:
+                decisions[key] = confirm_venv(path, reason)
+            if not decisions[key] or os.readlink(f"/proc/self/fd/{fd}") != path:
+                return False
+            confirmed_identity = key
+        elif not (remove_cached_venvs or in_trash or obsolete_extensions):
             return False
     if guarded and (markers.intersection(names) or {"HEAD", "objects", "refs"}.issubset(names)):
         return False
-    empty = True
+    empty = selected is None
     for name in names:
         if obsolete_extensions and apply and not relative and name == "package.json":
             continue  # Conserva el manifiesto si el recorrido se interrumpe.
@@ -1220,7 +1384,7 @@ def clean(fd, relative, mount, apply):
                 child = os.open(name, flags, dir_fd=fd)
                 try:
                     removable = (os.path.samestat(entry, os.fstat(child))
-                                 and mount_id(child) == mount and clean(child, path, mount, apply))
+                                 and mount_id(child) == mount and clean(child, path, mount, apply, selected))
                     if removable and apply:
                         current = os.stat(name, dir_fd=fd, follow_symlinks=False)
                         if os.path.samestat(entry, current):
@@ -1234,6 +1398,8 @@ def clean(fd, relative, mount, apply):
                     blocks += entry.st_blocks
                 else:
                     empty = False
+            elif selected is not None:
+                continue
             elif (not guarded and not obsolete_extensions) or stat.S_ISREG(entry.st_mode) or stat.S_ISLNK(entry.st_mode):
                 if apply:
                     os.unlink(name, dir_fd=fd)
@@ -1255,6 +1421,9 @@ def clean(fd, relative, mount, apply):
             empty = False
             if exc.errno != errno.ENOTEMPTY:
                 print(f"Se omite {os.path.join(root, path)!r}: {exc.strerror}", file=sys.stderr)
+    if obsolete_extensions and not apply and empty and confirmed_identity:
+        location, dev, ino = confirmed_identity
+        removable_venvs[location] = (dev, ino)
     return empty
 
 def read_extension_json(path, dir_fd=None):
@@ -1338,7 +1507,10 @@ def clean_obsolete(fd, mount, editor_roots):
                     continue
                 files = blocks = directories = 0
                 remaining_links.clear()
-                if not clean(child, "", mount, False):
+                decisions.clear()
+                removable_venvs.clear()
+                whole_extension = clean(child, "", mount, False)
+                if not whole_extension and not removable_venvs:
                     continue
                 size = (blocks + entry.st_blocks + 1) // 2
                 if apply:
@@ -1347,6 +1519,13 @@ def clean_obsolete(fd, mount, editor_roots):
                     if (not isinstance(current, dict) or current.get(name) is not True
                             or name.casefold() in locations or version in versions
                             or not os.path.samestat(entry, os.stat(name, dir_fd=fd, follow_symlinks=False))):
+                        continue
+                    if not whole_extension:
+                        files = blocks = directories = 0
+                        remaining_links.clear()
+                        clean(child, "", mount, True, selected=removable_venvs)
+                        if files or directories:
+                            print(f"{(blocks + 1) // 2}\t{path!r} (venvs confirmados en la extensión)")
                         continue
                     if not clean(child, "", mount, True):
                         continue
@@ -1917,6 +2096,7 @@ if [[ $mode != --migrate ]]; then
         printf 'Contenido eliminado:\n'
     fi
     any_cleaned=false
+    if [[ $mode == --fclean ]]; then exec {venv_input}<&0; fi
     exec {report_fd}< <(clean_app_caches; inspect_home_venvs)
     report_pid=$!
     while IFS=$'\t' read -r size_spec rest || [[ -n $size_spec ]]; do
@@ -1941,6 +2121,7 @@ if [[ $mode != --migrate ]]; then
     done <&"$report_fd"
     exec {report_fd}<&-
     wait "$report_pid" || die 'No se pudo completar el recorrido de limpieza.'
+    if [[ $mode == --fclean ]]; then exec {venv_input}<&-; fi
     if ! $any_cleaned; then
         printf 'No se encontró contenido que limpiar.\n'
     fi

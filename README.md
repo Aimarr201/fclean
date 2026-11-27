@@ -31,6 +31,7 @@ Para añadir solo el alias:
 ```zsh
 source ~/.config/fclean/fclean --alias
 ```
+
 > [!NOTE]
 > Si estás en la carpeta de una descarga o de un clon, usa `source ./fclean --alias`. El script retira la descarga o el clon oficial recién creado una vez que verifica la copia instalada. Conserva los repositorios con cambios locales.
 
@@ -47,7 +48,10 @@ fclean --clean
 | --- | --- |
 | `--dry-run` | Muestra qué se limpiaría, cuánto espacio se podría liberar y qué se puede migrar, sin modificar nada. |
 | `--clean` | Limpia cachés, versiones obsoletas de extensiones, la papelera y los venvs que lleven 5 días sin actividad. |
-| `--fclean` | Aplica la misma limpieza y borra de inmediato los venvs reconocidos, incluso si están activos. |
+| `--fclean` | Borra los venvs reconocidos, incluso activos. Pide confirmación para cada venv protegido. |
+| `--keep [ruta]` | Añade la protección de venv al proyecto indicado o al actual. |
+| `--unkeep [ruta]` | Retira la protección de venv al proyecto indicado o del actual. |
+| `--kept-list` | Muestra los proyectos protegidos. |
 | `--migrate-cache` | Traslada `~/.cache` a `sgoinfre` y deja un enlace simbólico. |
 | `--migrate` | Traslada las extensiones de VS Code a `sgoinfre` y deja un enlace simbólico. |
 | `--alias` | Añade el alias de Zsh apuntando a `~/.config/fclean/fclean`. |
@@ -68,13 +72,20 @@ fclean --clean
 
 Cuando `--clean` encuentra por primera vez un entorno virtual de Python asociado a un proyecto, empieza a registrar su uso. Solo lo borra tras cinco días completos sin actividad detectable en el entorno ni en el proyecto.
 
-Para conservar un venv con `--clean`, crea este archivo en la raíz del proyecto o del venv.
+Para conservar un venv, usa `fclean --keep` desde cualquier subcarpeta de un repositorio Git o proyecto Python. También puedes indicar una ruta, aunque todavía no hayas creado el venv.
 
 ```bash
-touch .fclean-keep
+fclean --keep ~/42/mi-proyecto
+fclean --kept-list
+fclean --unkeep ~/42/mi-proyecto
 ```
 
-`--fclean` se ejecuta solo de forma manual e ignora la asociación a proyectos.
+Con `--fclean`, cada venv protegido pregunta si lo quieres borrar o no. Aunque borres el venv el proyecto sigue registrado.
+
+`--uninstall` conserva el registro y `--funinstall` lo elimina.
+
+> [!WARNING]
+> Si mueves o renombras el proyecto, registra su nueva ruta con `--keep` y retira la anterior con `--unkeep`.
 
 ### Migrar a sgoinfre
 

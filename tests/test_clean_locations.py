@@ -64,9 +64,9 @@ class CleanLocationsTests(unittest.TestCase):
             personal.mkdir()
         return personal
 
-    def run_command(self, *command, cwd=None, check=True):
+    def run_command(self, *command, cwd=None, check=True, answers=""):
         result = subprocess.run(command, env=self.env, cwd=cwd or self.home,
-                                capture_output=True, text=True, timeout=30)
+                                input=answers, capture_output=True, text=True, timeout=30)
         if check:
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         return result
@@ -470,26 +470,126 @@ printf '%s' "$status"
         personal = self.mount_sgoinfre()
         local = self.home / ".cache/.entorno"
         moved = personal / ".cache/.entorno"
-        kept = self.home / ".cache/conservado"
+        kept = self.home / ".cache/proyecto/conservado"
         kept_remote = personal / ".cache/sub/conservado"
         for venv in (local, moved, kept, kept_remote):
             venv.parent.mkdir(parents=True, exist_ok=True)
             self.run_command(sys.executable, "-I", "-m", "venv", "--without-pip", venv)
         (local.parent / ".temporal").touch()
         (moved.parent / ".temporal").touch()
-        (kept / ".fclean-keep").touch()
-        (kept_remote / "lib/.fclean-keep").touch()
+        (local / ".fclean-keep").touch()
+        (moved / "lib/.fclean-keep").touch()
+        for project in (kept.parent, kept_remote.parent):
+            (project / "requirements.txt").touch()
+            self.run_cli("--keep", project)
         self.run_cli("--clean")
         for venv in (local, moved, kept, kept_remote):
             self.assertTrue((venv / "pyvenv.cfg").is_file())
             self.assertFalse((venv.parent / ".temporal").exists())
-        self.run_cli("--fclean")
+        result = self.run_cli("--fclean")
+        self.assertEqual(result.stderr.count("[y/N]"), 2)
         self.assertFalse(local.exists())
         self.assertFalse(moved.exists())
         self.assertTrue((kept / "pyvenv.cfg").is_file())
-        self.assertTrue((kept / ".fclean-keep").is_file())
         self.assertTrue((kept_remote / "pyvenv.cfg").is_file())
-        self.assertTrue((kept_remote / "lib/.fclean-keep").is_file())
+
+    def test_project_registry_resolves_roots_aliases_and_missing_worktrees(self):
+        config = self.home / "config con espacios"
+        self.env["XDG_CONFIG_HOME"] = str(config)
+        registry = config / "fclean/protected-projects.json"
+        self.assertIn("No hay proyectos", self.run_cli("--kept-list").stdout)
+        self.assertNotEqual(self.run_cli("--keep", check=False).returncode, 0)
+        self.assertFalse(config.exists())
+        repo = self.make_fclean_clone()
+        worktree = self.home / "otra copia"
+        self.run_command("git", "worktree", "add", "-q", "--detach", worktree, cwd=repo)
+        sub = worktree / "src"
+        sub.mkdir()
+        link = self.home / "enlace"
+        link.symlink_to(sub)
+        self.run_command("bash", SCRIPT, "--keep", cwd=sub)
+        self.run_cli("--keep", link)
+        self.assertEqual(json.loads(registry.read_text()), [str(worktree)])
+        self.assertFalse((worktree / ".fclean-keep").exists())
+        self.run_cli("--keep", repo)
+        python = self.put("python/pyproject.toml").parent
+        module = self.put("python/src/pkg.py").parent
+        self.run_cli("--keep", module)
+        self.assertEqual(set(json.loads(registry.read_text())), {str(worktree), str(repo), str(python)})
+        self.run_command("bash", SCRIPT, "--unkeep", cwd=sub)
+        self.run_cli("--uninstall")
+        self.assertEqual(set(json.loads(registry.read_text())), {str(repo), str(python)})
+        python.rename(self.home / "renombrado")
+        self.assertIn(f"{str(python)!r} (ruta ausente)", self.run_cli("--kept-list").stdout)
+        self.run_cli("--unkeep", python)
+        self.assertEqual(json.loads(registry.read_text()), [str(repo)])
+        self.run_cli("--funinstall")
+        self.assertFalse(registry.parent.exists())
+        self.assertTrue((repo / "fclean").exists())
+
+    def test_registered_cache_and_external_project_each_get_one_answer(self):
+        cache_project = self.put(".cache/repositorio/requirements.txt").parent
+        external_project = self.new_directory()
+        self.put("pyproject.toml", base=external_project)
+        for project in (cache_project, external_project):
+            self.run_cli("--keep", project)
+            self.run_command(sys.executable, "-I", "-m", "venv", "--without-pip", project / ".venv")
+        preview = self.run_cli("--dry-run")
+        for project in (cache_project, external_project):
+            self.assertIn(str(project / ".venv"), preview.stderr)
+        self.run_cli("--clean")
+        result = self.run_command("bash", SCRIPT, "--fclean", answers="quizá\nn\ny\n")
+        self.assertIn("Responde y o n", result.stderr)
+        self.assertTrue((cache_project / ".venv/bin/python").is_file())
+        self.assertFalse((external_project / ".venv").exists())
+        self.assertEqual(result.stderr.count("¿Borrar el venv protegido"), 3)
+        self.assertIn(str(external_project), self.run_cli("--kept-list").stdout)
+
+    def test_invalid_registry_preserves_venvs_and_is_not_overwritten(self):
+        project = self.put("proyecto/pyproject.toml").parent
+        venv = project / ".venv"
+        self.run_command(sys.executable, "-I", "-m", "venv", "--without-pip", venv)
+        registry = self.put(".config/fclean/protected-projects.json", "{")
+        for command in (("--fclean",), ("--keep", project), ("--kept-list",)):
+            with self.subTest(command=command):
+                result = self.run_cli(*command, check=False)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(str(registry), result.stderr)
+                self.assertEqual(registry.read_text(), "{")
+                self.assertTrue((venv / "bin/python").is_file())
+
+    def test_obsolete_extension_can_retain_one_venv_and_remove_another(self):
+        key = "ejemplo.editor-1.0.0"
+        extension = self.put(f".vscode/extensions/{key}/package.json", json.dumps({
+            "publisher": "ejemplo", "name": "editor", "version": "1.0.0",
+        })).parent
+        self.put(".vscode/extensions/.obsolete", json.dumps({key: True}))
+        self.put("pyproject.toml", base=extension)
+        self.run_cli("--keep", extension)
+        venvs = [extension / name for name in ("uno", "dos")]
+        for venv in venvs:
+            self.run_command(sys.executable, "-I", "-m", "venv", "--without-pip", venv)
+        original = (extension / "package.json").read_bytes()
+        result = self.run_command("bash", SCRIPT, "--fclean", answers="n\ny\n")
+        self.assertEqual(result.stderr.count("[y/N]"), 2)
+        kept, removed = sorted(venvs, key=lambda v: result.stderr.index(repr(str(v))))
+        self.assertTrue((kept / "bin/python").is_file())
+        self.assertFalse(removed.exists())
+        self.assertEqual((extension / "package.json").read_bytes(), original)
+
+    def test_project_registry_serializes_changes_from_two_sessions(self):
+        from concurrent.futures import ThreadPoolExecutor
+
+        projects = [self.put(f"proyecto {i}/requirements.txt").parent for i in range(4)]
+        sessions = [dict(self.env, XDG_RUNTIME_DIR=str(self.new_directory())) for project in projects]
+        def register(pair):
+            project, env = pair
+            subprocess.run(["bash", SCRIPT, "--keep", project], env=env, cwd=self.home, check=True,
+                           capture_output=True, timeout=10)
+        with ThreadPoolExecutor(max_workers=len(projects)) as executor:
+            list(executor.map(register, zip(projects, sessions)))
+        registry = self.home / ".config/fclean/protected-projects.json"
+        self.assertEqual(json.loads(registry.read_text()), sorted(map(str, projects)))
 
     def test_cache_migration_copies_links_and_can_be_repeated(self):
         personal = self.mount_sgoinfre()
