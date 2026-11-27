@@ -72,6 +72,9 @@ class CleanLocationsTests(unittest.TestCase):
         return result
 
     def run_cli(self, *options, check=True):
+        if options == ("--alias",):
+            download = self.put("descarga/fclean", SCRIPT.read_text())
+            return self.run_command("bash", download, *options, check=check)
         return self.run_command("bash", SCRIPT, *options, check=check)
 
     def put(self, relative, content="datos", base=None):
@@ -770,7 +773,7 @@ printf '%s' "$status"
         self.run_command("zsh", "-ic", "fclean --funinstall")
         self.assertEqual(zshrc.read_text(), "")
         self.assertFalse(installed.parent.exists())
-        self.assertEqual(source.read_text(), SCRIPT.read_text())
+        self.assertFalse(source.exists())
         self.assertNotEqual(self.run_command("zsh", "-ic", "alias fclean", check=False).returncode, 0)
 
     @unittest.skipUnless(shutil.which("zsh"), "requiere Zsh para probar ZDOTDIR y enlaces")
@@ -787,8 +790,8 @@ printf '%s' "$status"
         (dotdir / ".zshrc").symlink_to(custom)
         self.env["ZDOTDIR"] = str(dotdir)
         self.run_command("bash", link, "--alias")
-        link.unlink()
-        source.unlink()
+        self.assertFalse(link.is_symlink())
+        self.assertTrue(source.is_file())
         self.assertTrue((dotdir / ".zshrc").is_symlink())
         self.assertTrue(custom.read_text().startswith("export MI_VARIABLE=ejemplo\n"))
         self.assertEqual(normal.read_text(), "# predeterminada\n")
@@ -810,7 +813,7 @@ printf '%s' "$status"
         original = zshrc.read_text()
         self.run_command("zsh", "-ic", "fclean --alias")
         self.assertEqual(zshrc.read_text(), original)
-        self.run_command("bash", source, "--alias")
+        self.run_command("bash", installed, "--alias")
         self.assertEqual(zshrc.read_text().count("alias fclean="), 1)
         self.assertEqual(zshrc.read_text(), original)
         self.assertEqual(installed.read_bytes(), installed_text)
@@ -820,7 +823,7 @@ printf '%s' "$status"
         self.run_command("zsh", "-ic", "fclean --uninstall")
         self.assertIn("Uso: fclean", self.run_command("zsh", "-ic", "fclean --help").stdout)
 
-    def test_alias_only_edits_zsh_configuration_and_backs_up_user_content(self):
+    def test_alias_installs_script_and_backs_up_user_configuration(self):
         original = "export MI_VARIABLE=ejemplo\nalias fclean='echo personal'\n"
         zshrc = self.put(".zshrc", original)
         cached = self.put(".cache/conservar")
@@ -833,7 +836,9 @@ printf '%s' "$status"
         self.assertEqual(len(backups), 1)
         self.assertEqual(backups[0].read_text(), original)
         self.assertTrue(cached.is_file())
-        self.assertFalse((self.home / ".config").exists())
+        self.assertEqual((self.home / ".config/fclean/fclean").read_bytes(), SCRIPT.read_bytes())
+        self.assertFalse((self.home / "descarga/fclean").exists())
+        self.assertFalse((self.home / ".config/autostart").exists())
         self.assertFalse((self.home / "no-actualizar").exists())
 
     def test_alias_refuses_incomplete_managed_blocks_without_modifying_them(self):
@@ -845,6 +850,94 @@ printf '%s' "$status"
                 self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
                 self.assertEqual(zshrc.read_text(), broken)
                 self.assertEqual(list(self.home.glob(".zshrc.fclean.*")), [])
+                self.assertTrue((self.home / "descarga/fclean").is_file())
+
+    def make_fclean_clone(self, *, url="https://github.com/Aimarr201/fclean.git"):
+        seed = self.new_directory()
+        self.run_command("git", "init", "-q", "-b", "main", seed)
+        (seed / "fclean").write_bytes(SCRIPT.read_bytes())
+        (seed / ".gitignore").write_text("ignorado\n")
+        self.run_command("git", "add", ".", cwd=seed)
+        self.run_command("git", "-c", "user.name=Test", "-c", "user.email=prueba@example.com",
+                         "commit", "-qm", "publicación", cwd=seed)
+        repo = self.new_directory() / "clon de fclean"
+        # Git registra la URL original. El transporte usa la réplica local para probar sin red.
+        self.run_command("git", "-c", f"url.{seed}.insteadOf={url}", "clone", "-q", url, repo)
+        return repo
+
+    @unittest.skipUnless(shutil.which("zsh"), "requiere Zsh para recargar la sesión")
+    def test_alias_sourced_from_clone_removes_it_and_reloads_the_calling_zsh(self):
+        repo = self.make_fclean_clone(url="git@github.com:Aimarr201/fclean.git")
+        config = self.put("dotfiles/.zshrc", "[[ $# == 0 ]] || return 1\n(( ++recargas ))\n")
+        self.env["ZDOTDIR"] = str(config.parent)
+        result = self.run_command("zsh", "-fc", """
+            source ./fclean --alias || exit 1
+            [[ $recargas == 1 && $PWD == $HOME && $1 == exterior ]] || exit 2
+            eval 'fclean --alias' || exit 3
+            [[ $recargas == 2 ]] || exit 4
+            eval 'fclean --help'
+        """, "zsh", "exterior", cwd=repo)
+        self.assertIn("Uso: fclean", result.stdout)
+        self.assertFalse(repo.exists())
+        self.assertEqual((self.home / ".config/fclean/fclean").read_bytes(), SCRIPT.read_bytes())
+        self.assertFalse((self.home / ".zshrc").exists())
+
+    def test_alias_preserves_other_repositories_and_local_work(self):
+        cases = ("otro origen", "modificado", "ignorado", "sin seguimiento", "commit local",
+                 "rama local", "stash", "worktree", "etiqueta local", "origen cambiado")
+        for case in cases:
+            with self.subTest(case=case):
+                url = "https://github.com/Aimarr201/fclean.git"
+                if case in ("otro origen", "origen cambiado"):
+                    url = "https://github.com/otra-cuenta/fclean.git"
+                repo = self.make_fclean_clone(url=url)
+                if case == "origen cambiado":
+                    self.run_command("git", "remote", "set-url", "origin", "https://github.com/Aimarr201/fclean.git", cwd=repo)
+                elif case in ("modificado", "ignorado", "sin seguimiento"):
+                    self.put({"modificado": ".gitignore", "ignorado": "ignorado",
+                              "sin seguimiento": "personal"}[case], base=repo)
+                elif case in ("commit local", "stash"):
+                    self.put("personal", base=repo)
+                    self.run_command("git", "add", "personal", cwd=repo)
+                    action = ["commit", "-qm", "local"] if case == "commit local" else ["stash", "-q"]
+                    self.run_command("git", "-c", "user.name=Test", "-c", "user.email=prueba@example.com", *action, cwd=repo)
+                elif case == "rama local":
+                    self.run_command("git", "branch", "personal", cwd=repo)
+                elif case == "worktree":
+                    self.run_command("git", "worktree", "add", "-q", "--detach", self.new_directory() / "wt", cwd=repo)
+                elif case == "etiqueta local":
+                    self.run_command("git", "tag", "personal", cwd=repo)
+                result = self.run_command("bash", repo / "fclean", "--alias")
+                self.assertIn("Se conserva el repositorio", result.stderr)
+                self.assertTrue((repo / ".git").is_dir())
+                self.assertEqual((repo / "fclean").read_bytes(), SCRIPT.read_bytes())
+
+    def test_alias_recognizes_fresh_https_and_ssh_clones(self):
+        for url in ("https://github.com/Aimarr201/fclean.git", "ssh://git@github.com/Aimarr201/fclean.git"):
+            with self.subTest(url=url):
+                repo = self.make_fclean_clone(url=url)
+                self.run_command("bash", repo / "fclean", "--alias")
+                self.assertFalse(repo.exists())
+                self.assertEqual((self.home / ".config/fclean/fclean").read_bytes(), SCRIPT.read_bytes())
+
+    def test_alias_only_removes_download_after_installing_identical_copy(self):
+        installed = self.put(".config/fclean/fclean", "archivo personal")
+        source = self.put("descarga/fclean", SCRIPT.read_text())
+        neighbor = self.put("descarga/apuntes")
+        result = self.run_command("bash", source, "--alias", check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(installed.read_text(), "archivo personal")
+        self.assertFalse((self.home / ".zshrc").exists())
+        installed.write_text(SCRIPT.read_text() + "\n# otra versión\n")
+        result = self.run_command("bash", source, "--alias")
+        self.assertIn("Se conserva el origen", result.stderr)
+        self.assertTrue(source.is_file())
+        self.assertTrue(installed.read_text().endswith("# otra versión\n"))
+        installed.unlink()
+        self.run_command("bash", source, "--alias")
+        self.assertFalse(source.exists())
+        self.assertEqual(neighbor.read_text(), "datos")
+        self.assertEqual(installed.read_bytes(), SCRIPT.read_bytes())
 
     @unittest.skipUnless(shutil.which("zsh"), "requiere Zsh para probar el alias")
     def test_install_alias_autostart_reinstall_and_uninstall(self):

@@ -1,6 +1,22 @@
 #!/usr/bin/env bash
 # fclean para las sesiones de usuario de Ubuntu del campus 42.
 # fclean: actualizaciones v1
+# Al usar «source ./fclean --alias», la recarga pertenece a la Zsh que llamó al script.
+if [ -n "${ZSH_VERSION:-}" ] && [ -z "${BASH_VERSION:-}" ]; then
+    if [[ $ZSH_EVAL_CONTEXT == *:file ]]; then
+        if [[ $# != 1 || $1 != --alias ]]; then
+            printf '%s\n' 'Usa source ./fclean --alias para configurar esta sesión.' >&2
+            return 2
+        fi
+        FCLEAN_RELOAD_ZSH=1 /bin/bash -- "${(%):-%x}" --alias || return $?
+        # El directorio actual puede haber sido el clon recién retirado.
+        if [[ ! -d $PWD ]]; then builtin cd -q -- "$HOME" || return $?; fi
+        set --
+        builtin source "${ZDOTDIR:-$HOME}/.zshrc"
+        return $?
+    fi
+    exec /bin/bash -- "$0" "$@"
+fi
 set -euo pipefail
 umask 077
 shopt -s nullglob
@@ -14,7 +30,7 @@ Uso: fclean [opción] o bash fclean [opción]
   --fclean         Misma limpieza con borrado inmediato de venvs reconocidos.
   --migrate        Traslada las extensiones de VS Code a sgoinfre.
   --migrate-cache  Traslada ~/.cache a sgoinfre.
-  --alias          Añade solo el alias de Zsh a la copia de ~/.config/fclean.
+  --alias          Instala el script y el alias de Zsh, y retira la descarga original.
   --install        Configura el alias en Zsh y la limpieza al iniciar sesión.
   --uninstall      Retira el inicio automático y la configuración de sgoinfre; conserva el alias.
   --funinstall     Retira toda la instalación, incluido el script y el seguimiento de venvs.
@@ -163,7 +179,8 @@ has_legacy_block() {
 
 write_zsh_alias() {
     local command
-    printf -v command '/bin/bash %q' "$1"
+    printf -v command '() { FCLEAN_RELOAD_ZSH=1 /bin/bash %q "$@" || return $?; ' "$1"
+    command+='if [[ $# == 1 && $1 == --alias ]]; then set --; builtin source "${ZDOTDIR:-$HOME}/.zshrc"; fi; }'
     printf 'alias fclean=%q\n' "$command"
 }
 
@@ -305,6 +322,131 @@ update_zshrc() (
     printf 'Configuración de Zsh actualizada en %s\n' "$file"
 )
 
+# Protege también montajes bind, que pueden tener el mismo número de dispositivo.
+mounts=()
+while read -r _ _ _ _ target _; do
+    printf -v target '%b' "$target"
+    mounts+=("$target")
+done < /proc/self/mountinfo
+
+disposable_fclean_clone() (
+    local root=$1 url branch ref history changes path resolved
+    [[ -d $root/.git && ! -L $root/.git && -O $root && -O $root/.git ]] || return 1
+    for path in "$home" "$installed" "$zshrc" "$runtime"; do
+        resolved=$(realpath -m -- "$path") || return 1
+        [[ $path != "$root" && $path != "$root/"* && $resolved != "$root" && $resolved != "$root/"* ]] || return 1
+    done
+    for path in "${mounts[@]}"; do
+        [[ $path != "$root" && $path != "$root/"* ]] || return 1
+    done
+    # Las consultas deben describir este clon, incluso si se invocó fclean desde otro repositorio.
+    for path in "${!GIT_@}"; do unset "$path"; done
+    cd -P -- "$root" || return 1
+    [[ $(git remote) == origin ]] || return 1
+    url=$(git config --local --get-all remote.origin.url) || return 1
+    case ${url%/} in
+        https://github.com/*) path=${url#https://github.com/} ;;
+        ssh://git@github.com/*) path=${url#ssh://git@github.com/} ;;
+        git@github.com:*) path=${url#git@github.com:} ;;
+        *) return 1 ;;
+    esac
+    path=${path%/}
+    [[ ${path,,} == aimarr201/fclean || ${path,,} == aimarr201/fclean.git ]] || return 1
+    branch=$(git symbolic-ref --quiet --short HEAD) || return 1
+    [[ $(git for-each-ref --format='%(refname:short)' refs/heads) == "$branch" ]] || return 1
+    ref=$(git rev-parse --verify "refs/remotes/origin/$branch") || return 1
+    [[ $(git rev-parse HEAD) == "$ref" ]] || return 1
+    # Git puede omitir el usuario SSH de la URL que registra en el reflog.
+    history=$(git reflog show --format='%H %gs' HEAD) || return 1
+    [[ $history == "$ref clone: from $url" || $history == "$ref clone: from ${url/git@github.com/github.com}" ]] || return 1
+    # Un clon recién creado no contiene árboles de trabajo adicionales, operaciones pendientes ni archivos personales en .git.
+    shopt -s dotglob
+    for path in .git/*; do
+        case ${path##*/} in
+            HEAD|branches|config|description|hooks|index|info|logs|objects|packed-refs|refs|shallow) ;;
+            *) return 1 ;;
+        esac
+    done
+    changes=$(git for-each-ref --format='%(refname)') || return 1
+    while IFS= read -r path; do
+        case $path in
+            "refs/heads/$branch"|refs/remotes/origin/*|refs/tags/*) ;;
+            *) return 1 ;;
+        esac
+    done <<< "$changes"
+    # Las etiquetas de un clon nuevo están empaquetadas. Una etiqueta local también cuenta como trabajo propio.
+    for path in .git/refs/tags/* .git/hooks/* .git/info/*; do
+        [[ $path == .git/hooks/*.sample || $path == .git/info/exclude ]] || return 1
+    done
+    git ls-files --error-unmatch -- fclean >/dev/null || return 1
+    changes=$(git -c core.fsmonitor=false -c core.fileMode=true status --porcelain --untracked-files=all --ignored --ignore-submodules=none) || return 1
+    [[ -z $changes ]] || return 1
+    changes=$(git ls-files -v) || return 1
+    while IFS= read -r path; do [[ $path == 'H '* ]] || return 1; done <<< "$changes"
+)
+
+install_alias() (
+    local entry=${BASH_SOURCE[0]} dir=${installed%/*} source parent path tmp='' identity retiring
+    parent=$(cd -P -- "$(dirname -- "$entry")" && pwd -P)
+    source=$parent/${entry##*/}
+    identity=$(stat -c '%d:%i:%z' -- "$source")
+    [[ ! -L $dir ]] || die "La carpeta de instalación es un enlace: $dir"
+    mkdir -p -- "$dir"
+    if ! present "$installed"; then
+        tmp=$(mktemp -- "$dir/.instalacion.XXXXXXXX")
+        trap 'rm -f -- "$tmp"' EXIT
+        cp -- "$source" "$tmp"
+        valid_update "$tmp" || die 'La copia del script no es válida.'
+        mv -nT -- "$tmp" "$installed"
+    fi
+    valid_update "$installed" || die "El destino no es una copia válida de fclean: $installed"
+    update_zshrc alias "$zshrc"
+    printf 'Alias fclean configurado para %s.\n' "$installed"
+    if [[ ${FCLEAN_RELOAD_ZSH:-} != 1 ]]; then
+        printf 'Para activarlo en la Zsh actual, ejecuta: source %q\n' "$zshrc"
+    fi
+    [[ $source != "$(realpath -e -- "$installed")" ]] || return 0
+    if [[ ! -O $source || $(stat -c '%d:%i:%z' -- "$source") != "$identity" ]] || ! cmp -s -- "$source" "$installed"; then
+        notice "Se conserva el origen porque tiene otro propietario o su contenido difiere de la copia instalada: $source"
+        return 0
+    fi
+    # Busca también .git sin Git disponible: un fallo de detección no convierte un proyecto en una descarga suelta.
+    path=$parent
+    while [[ ! -f $path/.git && ! -L $path/.git && ! -e $path/.git/HEAD &&
+             ! ( -d $path/.git && ! -x $path/.git ) &&
+             ! ( -d $path/objects && -d $path/refs && -f $path/HEAD ) ]]; do
+        if [[ $path == / ]]; then
+            if [[ $(stat -c '%d:%i:%z' -- "$source") != "$identity" ]]; then
+                notice "El archivo de origen cambió durante la instalación: $source"
+                return 0
+            fi
+            rm -f -- "$source"
+            printf 'Archivo de descarga retirado: %s\n' "$source"
+            return 0
+        fi
+        path=$(dirname -- "$path")
+    done
+    if [[ $source == "$path/fclean" && ! -L $source ]] && disposable_fclean_clone "$path"; then
+        # Revalida en una carpeta privada. Otra descarga puede ocupar el nombre original mientras tanto.
+        retiring=$(mktemp -d -- "${path%/*}/.fclean-clon.XXXXXXXX")
+        if ! mv -T -- "$path" "$retiring/clon"; then
+            rmdir -- "$retiring"
+            die "No se pudo retirar el clon: $path"
+        fi
+        if disposable_fclean_clone "$retiring/clon" && cmp -s -- "$retiring/clon/fclean" "$installed"; then
+            rm -rf --one-file-system -- "$retiring/clon"
+            printf 'Clon de fclean retirado: %s\n' "$path"
+        else
+            mv -nT -- "$retiring/clon" "$path" && [[ ! -d $retiring/clon ]] ||
+                die "El clon cambió. Sus archivos están en $retiring/clon"
+            notice "Se conserva el clon porque cambió durante la instalación: $path"
+        fi
+        rmdir -- "$retiring"
+    else
+        notice "Se conserva el repositorio de origen: $path"
+    fi
+)
+
 install_autostart() (
     local dir=${installed%/*} tmp entry path
     if present "$desktop"; then
@@ -333,10 +475,7 @@ install_autostart() (
 )
 
 case $mode in
-    --alias)
-        update_zshrc alias "$zshrc"
-        printf 'Alias fclean configurado para %s. Abre una nueva terminal Zsh para usarlo.\n' "$installed"
-        exit 0 ;;
+    --alias) install_alias; exit 0 ;;
     --install) install_autostart; exit 0 ;;
     --uninstall)
         if present "$desktop"; then
@@ -349,13 +488,6 @@ case $mode in
         printf 'Inicio automático desactivado.\n'
         exit 0 ;;
 esac
-
-# Protege también montajes bind, que pueden tener el mismo número de dispositivo.
-mounts=()
-while read -r _ _ _ _ target _; do
-    printf -v target '%b' "$target"
-    mounts+=("$target")
-done < /proc/self/mountinfo
 
 plain_directory() {
     local root=$1 dir=$2 mount

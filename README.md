@@ -20,7 +20,6 @@ Para el uso habitual, se recomienda usar `--install`. Esto añade el alias `fcle
 bash ~/.config/fclean/fclean --install
 ```
 
-Abre una nueva terminal para usar el alias desde cualquier carpeta. Ejecuta `fclean --clean` si quieres limpiar al momento.
 
 > [!NOTE]
 > Si ejecutaste `--install` desde otro directorio o un repositorio clonado, ya puedes borrar esa carpeta original porque el script queda guardado en `~/.config/fclean/fclean`.
@@ -30,9 +29,11 @@ Abre una nueva terminal para usar el alias desde cualquier carpeta. Ejecuta `fcl
 
 Para añadir solo el alias:
 
-```bash
-bash ~/.config/fclean/fclean --alias
+```zsh
+source ~/.config/fclean/fclean --alias
 ```
+> [!NOTE]
+> Si estás en la carpeta de una descarga o de un clon, usa `source ./fclean --alias`. El script retira la descarga o el clon oficial recién creado una vez que verifica la copia instalada. Conserva los repositorios con cambios locales.
 
 Para ejecutar la limpieza en cualquier momento:
 
@@ -40,8 +41,6 @@ Para ejecutar la limpieza en cualquier momento:
 fclean --clean
 ```
 
-
-Abre una nueva terminal Zsh para usar el alias desde cualquier carpeta.
 
 ## Qué hace
 
@@ -52,7 +51,7 @@ Abre una nueva terminal Zsh para usar el alias desde cualquier carpeta.
 | `--fclean` | Aplica la misma limpieza y borra de inmediato los venvs reconocidos, incluso si están activos. |
 | `--migrate-cache` | Traslada `~/.cache` a `sgoinfre` y deja un enlace simbólico. |
 | `--migrate` | Traslada las extensiones de VS Code a `sgoinfre` y deja un enlace simbólico. |
-| `--alias` | Añade solo el alias de Zsh apuntando a `~/.config/fclean/fclean` (no copia el script). |
+| `--alias` | Añade el alias de Zsh apuntando a `~/.config/fclean/fclean`. |
 | `--install` | Copia el script en `~/.config/fclean/fclean` e instala el alias, el inicio automático y la configuración de Zsh para `sgoinfre`. |
 | `--uninstall` | Desactiva el inicio automático y retira la configuración de `sgoinfre` de Zsh. Conserva el alias y el seguimiento de los venvs. |
 | `--funinstall` | Retira el script instalado, el inicio automático, el alias, las copias de `.zshrc` y el seguimiento de los venvs. Conserva los venvs y los enlaces migrados a `sgoinfre`. |
